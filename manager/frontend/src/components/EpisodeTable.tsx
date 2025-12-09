@@ -314,7 +314,6 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   // Determine special modes based on tab or status filter
   const isIgnoredMode = activeTab === 'ignored' || statusFilter === 'ignored'
   const isCleanedMode = activeTab === 'cleaned' || statusFilter === 'cleaned'
-  const isQueuedMode = activeTab === 'queued' || statusFilter === 'queued' || statusFilter === 'processing'
 
   const coreRowModel = useMemo(() => getCoreRowModel(), [])
 
