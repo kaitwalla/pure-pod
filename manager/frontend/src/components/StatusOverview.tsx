@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { CheckCircle, Clock, Loader2, AlertCircle, Search } from 'lucide-react'
+import { CheckCircle, Clock, AlertCircle, Search } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { episodesApi } from '@/lib/api'
 
