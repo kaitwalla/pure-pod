@@ -26,6 +26,7 @@ export interface Episode {
   image_url: string | null
   published_at: string | null
   local_filename: string | null
+  cleaned_audio_url: string | null
   error_message: string | null
   created_at: string
   updated_at: string

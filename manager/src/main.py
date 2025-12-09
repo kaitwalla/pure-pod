@@ -19,6 +19,7 @@ STATIC_DIR = Path(__file__).parent.parent / "static"
 from .database import init_db, engine
 from .models import Feed, Episode, EpisodeStatus, generate_slug
 from .ingest import ingest_feed, extract_feed_metadata
+from .storage import get_audio_url, get_file_size
 from .tasks import dispatch_episode_processing, sync_task_statuses
 
 logging.basicConfig(level=logging.INFO)
@@ -426,7 +427,6 @@ async def get_feed_rss(slug: str, session: Session = Depends(get_db_session)):
             ET.SubElement(item, f"{{{ITUNES_NS}}}image", href=ep_image)
 
         # Build public URL for the audio file and get file size
-        from .storage import get_audio_url, get_file_size
         audio_url = get_audio_url(episode.local_filename)
         file_size = get_file_size(episode.local_filename)
 
@@ -456,6 +456,7 @@ class EpisodeWithFeed(BaseModel):
     image_url: str | None
     published_at: datetime | None
     local_filename: str | None
+    cleaned_audio_url: str | None
     error_message: str | None
     created_at: datetime
     updated_at: datetime
@@ -550,6 +551,7 @@ async def list_episodes(
             image_url=ep.image_url,
             published_at=ep.published_at,
             local_filename=ep.local_filename,
+            cleaned_audio_url=get_audio_url(ep.local_filename) if ep.local_filename else None,
             error_message=ep.error_message,
             created_at=ep.created_at,
             updated_at=ep.updated_at,

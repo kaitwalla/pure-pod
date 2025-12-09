@@ -86,8 +86,8 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
           return episodesApi.list({ ...baseParams, exclude_statuses: 'discovered,cleaned,ignored,failed' })
         case 'inbox':
         default:
-          // Inbox: show discovered and failed episodes
-          return episodesApi.list({ ...baseParams, exclude_statuses: 'ignored,cleaned,queued,processing' })
+          // Inbox: show only discovered episodes
+          return episodesApi.list({ ...baseParams, status: 'discovered' })
       }
     },
   })
@@ -303,8 +303,8 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
       if (isFailedMode) {
         return status === 'failed' // Allow selecting failed episodes to queue or ignore
       }
-      // Allow selecting discovered, failed, queued, and processing episodes
-      return status === 'discovered' || status === 'failed' || status === 'queued' || status === 'processing'
+      // Allow selecting discovered episodes in inbox
+      return status === 'discovered'
     },
     onRowSelectionChange: setRowSelection,
     getCoreRowModel: coreRowModel,
@@ -458,30 +458,48 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
         </div>
         {selectedEpisodes.length > 0 && (
           <div className="flex gap-2">
-            {/* Inbox and Failed tabs: Queue and Ignore actions */}
-            {(activeTab === 'inbox' || activeTab === 'failed') && (
+            {/* Inbox tab: Queue and Ignore actions for discovered episodes */}
+            {activeTab === 'inbox' && selectedEpisodes.some((ep) => ep.status === 'discovered') && (
               <>
-                {selectedEpisodes.some((ep) => ep.status === 'discovered' || ep.status === 'failed') && (
-                  <Button
-                    onClick={handleQueueSelected}
-                    disabled={queueMutation.isPending}
-                    size="sm"
-                  >
-                    <ListPlus className="mr-2 h-4 w-4" />
-                    Queue
-                  </Button>
-                )}
-                {selectedEpisodes.some((ep) => ep.status === 'discovered' || ep.status === 'failed') && (
-                  <Button
-                    onClick={handleIgnoreSelected}
-                    disabled={ignoreMutation.isPending}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <EyeOff className="mr-2 h-4 w-4" />
-                    Ignore
-                  </Button>
-                )}
+                <Button
+                  onClick={handleQueueSelected}
+                  disabled={queueMutation.isPending}
+                  size="sm"
+                >
+                  <ListPlus className="mr-2 h-4 w-4" />
+                  Queue
+                </Button>
+                <Button
+                  onClick={handleIgnoreSelected}
+                  disabled={ignoreMutation.isPending}
+                  size="sm"
+                  variant="outline"
+                >
+                  <EyeOff className="mr-2 h-4 w-4" />
+                  Ignore
+                </Button>
+              </>
+            )}
+            {/* Failed tab: Queue and Ignore actions */}
+            {activeTab === 'failed' && selectedEpisodes.some((ep) => ep.status === 'failed') && (
+              <>
+                <Button
+                  onClick={handleQueueSelected}
+                  disabled={queueMutation.isPending}
+                  size="sm"
+                >
+                  <ListPlus className="mr-2 h-4 w-4" />
+                  Queue
+                </Button>
+                <Button
+                  onClick={handleIgnoreSelected}
+                  disabled={ignoreMutation.isPending}
+                  size="sm"
+                  variant="outline"
+                >
+                  <EyeOff className="mr-2 h-4 w-4" />
+                  Ignore
+                </Button>
               </>
             )}
             {/* Queued tab: Unqueue and Mark Failed actions */}
@@ -734,11 +752,18 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
                 </p>
               </div>
 
-              {selectedEpisode.local_filename && (
+              {selectedEpisode.cleaned_audio_url && (
                 <div>
-                  <span className="text-sm text-muted-foreground">Cleaned File</span>
+                  <span className="text-sm text-muted-foreground">Cleaned Audio</span>
                   <p className="text-sm font-mono break-all bg-muted p-2 rounded">
-                    {selectedEpisode.local_filename}
+                    <a
+                      href={selectedEpisode.cleaned_audio_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:underline"
+                    >
+                      {selectedEpisode.cleaned_audio_url}
+                    </a>
                   </p>
                 </div>
               )}

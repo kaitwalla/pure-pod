@@ -27,7 +27,7 @@ export function StatusOverview({ onTabClick }: StatusOverviewProps) {
   }> = [
     {
       label: 'Inbox',
-      count: stats.discovered + stats.failed,
+      count: stats.discovered,
       icon: Search,
       color: 'text-blue-500',
       tab: 'inbox',
