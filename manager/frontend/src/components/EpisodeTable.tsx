@@ -13,6 +13,12 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
   Table,
   TableBody,
   TableCell,
@@ -47,6 +53,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   const [statusFilter, setStatusFilter] = useState<string | undefined>(initialStatusFilter ?? undefined)
   const [page, setPage] = useState(1)
   const pageSize = 25
+  const [errorModalOpen, setErrorModalOpen] = useState(false)
+  const [selectedError, setSelectedError] = useState<{ title: string; error: string } | null>(null)
 
   // Update status filter when prop changes from parent (StatusOverview click)
   useEffect(() => {
@@ -230,21 +238,25 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         cell: ({ row }) => {
           const status = row.original.status
           const errorMessage = row.original.error_message
+          const title = row.original.title
           if (status !== 'failed' || !errorMessage) return null
           // Show first line of error, truncated
           const firstLine = errorMessage.split('\n')[0]
           return (
-            <div
-              className="max-w-[300px] truncate text-sm text-destructive"
-              title={errorMessage}
+            <button
+              onClick={() => {
+                setSelectedError({ title, error: errorMessage })
+                setErrorModalOpen(true)
+              }}
+              className="max-w-[300px] truncate text-sm text-destructive text-left hover:underline cursor-pointer"
             >
               {firstLine}
-            </div>
+            </button>
           )
         },
       },
     ],
-    []
+    [setSelectedError, setErrorModalOpen]
   )
 
   // Determine special modes based on tab or status filter
@@ -572,6 +584,29 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
           </div>
         </div>
       )}
+
+      {/* Error Details Modal */}
+      <Dialog open={errorModalOpen} onOpenChange={setErrorModalOpen}>
+        <DialogContent>
+          <DialogHeader onClose={() => setErrorModalOpen(false)}>
+            <DialogTitle>Error Details</DialogTitle>
+          </DialogHeader>
+          {selectedError && (
+            <div className="space-y-4">
+              <div>
+                <span className="text-sm text-muted-foreground">Episode:</span>
+                <p className="font-medium">{selectedError.title}</p>
+              </div>
+              <div>
+                <span className="text-sm text-muted-foreground">Error:</span>
+                <pre className="mt-2 p-4 bg-muted rounded-md text-sm overflow-auto max-h-[400px] whitespace-pre-wrap font-mono">
+                  {selectedError.error}
+                </pre>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
