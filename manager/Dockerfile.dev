@@ -1,0 +1,108 @@
+# Development Dockerfile - Vite serves on 8000, proxies API to internal backend
+FROM node:20-alpine AS frontend
+
+WORKDIR /frontend
+COPY manager/frontend/package.json manager/frontend/package-lock.json ./
+RUN npm ci
+COPY manager/frontend ./
+
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies + Node.js for running Vite
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python requirements and install
+COPY manager/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY manager/src ./src
+COPY shared ./shared
+
+# Copy frontend with node_modules from builder
+COPY --from=frontend /frontend ./frontend
+
+# Create audio storage directory
+RUN mkdir -p /app/audio
+
+# Install a process manager to run both services
+RUN pip install supervisor
+
+# Create startup script that generates vite config with PUBLIC_HOSTNAME
+RUN cat > /app/start.sh << 'SCRIPT'
+#!/bin/bash
+# Extract hostname without port for allowedHosts
+ALLOWED_HOST=$(echo "${PUBLIC_HOSTNAME:-localhost}" | cut -d: -f1)
+
+cat > /app/frontend/vite.config.dev.ts << EOF
+import { defineConfig } from "vite"
+import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
+import path from "path"
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  server: {
+    host: "0.0.0.0",
+    port: 8000,
+    allowedHosts: ["localhost", "${ALLOWED_HOST}"],
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8001",
+      },
+      "/feed": { target: "http://127.0.0.1:8001" },
+      "/files": { target: "http://127.0.0.1:8001" },
+      "/health": { target: "http://127.0.0.1:8001" },
+      "/ws": {
+        target: "ws://127.0.0.1:8001",
+        ws: true,
+      },
+    },
+  },
+})
+EOF
+
+exec supervisord -c /etc/supervisord.conf
+SCRIPT
+RUN chmod +x /app/start.sh
+
+# Create supervisor config - backend on 8001, vite on 8000
+RUN echo '[supervisord]\n\
+nodaemon=true\n\
+logfile=/dev/stdout\n\
+logfile_maxbytes=0\n\
+\n\
+[program:backend]\n\
+command=uvicorn src.main:app --host 127.0.0.1 --port 8001 --reload\n\
+directory=/app\n\
+stdout_logfile=/dev/stdout\n\
+stdout_logfile_maxbytes=0\n\
+stderr_logfile=/dev/stderr\n\
+stderr_logfile_maxbytes=0\n\
+\n\
+[program:frontend]\n\
+command=npm run dev -- --config vite.config.dev.ts\n\
+directory=/app/frontend\n\
+stdout_logfile=/dev/stdout\n\
+stdout_logfile_maxbytes=0\n\
+stderr_logfile=/dev/stderr\n\
+stderr_logfile_maxbytes=0\n\
+' > /etc/supervisord.conf
+
+EXPOSE 8000
+
+CMD ["/app/start.sh"]
