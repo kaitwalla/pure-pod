@@ -8,7 +8,7 @@ import {
   type RowSelectionState,
 } from '@tanstack/react-table'
 import { format } from 'date-fns'
-import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, X, Undo2, XCircle, AlertCircle, ArrowUp, ArrowDown, ArrowUpDown, RotateCcw } from 'lucide-react'
+import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, Undo2, XCircle, AlertCircle, ArrowUp, ArrowDown, ArrowUpDown, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/table'
 import { episodesApi, feedsApi } from '@/lib/api'
 import type { Episode, EpisodeStatus, Feed } from '@/types/api'
+import type { EpisodeTab } from './StatusOverview'
 
 const statusVariantMap: Record<EpisodeStatus, 'default' | 'secondary' | 'destructive' | 'outline'> = {
   discovered: 'secondary',
@@ -38,19 +39,15 @@ const statusVariantMap: Record<EpisodeStatus, 'default' | 'secondary' | 'destruc
   ignored: 'secondary',
 }
 
-type TabType = 'active' | 'queued' | 'cleaned' | 'ignored'
-
 interface EpisodeTableProps {
-  initialStatusFilter?: string | null
-  onClearFilter?: () => void
+  activeTab: EpisodeTab
+  onTabChange: (tab: EpisodeTab) => void
 }
 
-export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTableProps) {
+export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
   const queryClient = useQueryClient()
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({})
-  const [activeTab, setActiveTab] = useState<TabType>('active')
   const [selectedFeedId, setSelectedFeedId] = useState<number | undefined>()
-  const [statusFilter, setStatusFilter] = useState<string | undefined>(initialStatusFilter ?? undefined)
   const [page, setPage] = useState(1)
   const pageSize = 25
   const [errorModalOpen, setErrorModalOpen] = useState(false)
@@ -60,76 +57,38 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   const [selectedEpisode, setSelectedEpisode] = useState<Episode | null>(null)
   const [episodeModalOpen, setEpisodeModalOpen] = useState(false)
 
-  // Update status filter when prop changes from parent (StatusOverview click)
+  // Reset selection and page when tab changes
   useEffect(() => {
-    // Only sync when prop is a valid status string
-    if (typeof initialStatusFilter === 'string' && initialStatusFilter.length > 0) {
-      setStatusFilter(initialStatusFilter)
-      setActiveTab('active') // Reset tab when using status filter
-      setRowSelection({})
-      setPage(1)
-    }
-  }, [initialStatusFilter])
+    setRowSelection({})
+    setPage(1)
+  }, [activeTab])
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['episodes', selectedFeedId, activeTab, statusFilter, sortBy, sortOrder, page],
+    queryKey: ['episodes', selectedFeedId, activeTab, sortBy, sortOrder, page],
     queryFn: () => {
-      // If we have a specific status filter from StatusOverview, use that
-      if (statusFilter) {
-        return episodesApi.list({
-          feed_id: selectedFeedId,
-          status: statusFilter,
-          sort_by: sortBy,
-          sort_order: sortOrder,
-          page,
-          page_size: pageSize,
-        })
-      }
-
-      // Otherwise, use tab logic
-      if (activeTab === 'ignored') {
-        return episodesApi.list({
-          feed_id: selectedFeedId,
-          status: 'ignored',
-          sort_by: sortBy,
-          sort_order: sortOrder,
-          page,
-          page_size: pageSize,
-        })
-      }
-
-      if (activeTab === 'cleaned') {
-        return episodesApi.list({
-          feed_id: selectedFeedId,
-          status: 'cleaned',
-          sort_by: sortBy,
-          sort_order: sortOrder,
-          page,
-          page_size: pageSize,
-        })
-      }
-
-      if (activeTab === 'queued') {
-        // Queued tab: show queued and processing episodes
-        return episodesApi.list({
-          feed_id: selectedFeedId,
-          exclude_statuses: 'discovered,cleaned,ignored,failed',
-          sort_by: sortBy,
-          sort_order: sortOrder,
-          page,
-          page_size: pageSize,
-        })
-      }
-
-      // Active tab: exclude ignored, cleaned, queued, and processing
-      return episodesApi.list({
+      const baseParams = {
         feed_id: selectedFeedId,
-        exclude_statuses: 'ignored,cleaned,queued,processing',
         sort_by: sortBy,
         sort_order: sortOrder,
         page,
         page_size: pageSize,
-      })
+      }
+
+      switch (activeTab) {
+        case 'ignored':
+          return episodesApi.list({ ...baseParams, status: 'ignored' })
+        case 'cleaned':
+          return episodesApi.list({ ...baseParams, status: 'cleaned' })
+        case 'failed':
+          return episodesApi.list({ ...baseParams, status: 'failed' })
+        case 'queued':
+          // Queued tab: show queued and processing episodes
+          return episodesApi.list({ ...baseParams, exclude_statuses: 'discovered,cleaned,ignored,failed' })
+        case 'inbox':
+        default:
+          // Inbox: show discovered and failed episodes
+          return episodesApi.list({ ...baseParams, exclude_statuses: 'ignored,cleaned,queued,processing' })
+      }
     },
   })
 
@@ -320,9 +279,10 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
     [setSelectedError, setErrorModalOpen, sortBy, sortOrder]
   )
 
-  // Determine special modes based on tab or status filter
-  const isIgnoredMode = activeTab === 'ignored' || statusFilter === 'ignored'
-  const isCleanedMode = activeTab === 'cleaned' || statusFilter === 'cleaned'
+  // Determine special modes based on tab
+  const isIgnoredMode = activeTab === 'ignored'
+  const isCleanedMode = activeTab === 'cleaned'
+  const isFailedMode = activeTab === 'failed'
 
   const coreRowModel = useMemo(() => getCoreRowModel(), [])
 
@@ -339,6 +299,9 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       }
       if (isIgnoredMode) {
         return status === 'ignored'
+      }
+      if (isFailedMode) {
+        return status === 'failed' // Allow selecting failed episodes to queue or ignore
       }
       // Allow selecting discovered, failed, queued, and processing episodes
       return status === 'discovered' || status === 'failed' || status === 'queued' || status === 'processing'
@@ -392,21 +355,6 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
     }
   }
 
-  const handleTabChange = (tab: TabType) => {
-    setActiveTab(tab)
-    setStatusFilter(undefined) // Clear status filter when changing tabs
-    if (onClearFilter) onClearFilter()
-    setRowSelection({})
-    setPage(1)
-  }
-
-  const handleClearStatusFilter = () => {
-    setStatusFilter(undefined)
-    if (onClearFilter) onClearFilter()
-    setRowSelection({})
-    setPage(1)
-  }
-
   const handleFeedFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const value = e.target.value
     setSelectedFeedId(value ? Number(value) : undefined)
@@ -436,52 +384,43 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
 
   return (
     <div className="space-y-4">
-      {/* Status Filter Badge */}
-      {statusFilter && (
-        <div className="flex items-center gap-2 p-2 bg-muted rounded-md">
-          <span className="text-sm">
-            Showing: <strong>{statusFilter.charAt(0).toUpperCase() + statusFilter.slice(1)}</strong> episodes
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleClearStatusFilter}
-            className="h-6 w-6 p-0"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-      )}
-
       {/* Tabs and Filters */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex gap-2">
           <Button
-            variant={activeTab === 'active' && !statusFilter ? 'default' : 'outline'}
+            variant={activeTab === 'inbox' ? 'default' : 'outline'}
             size="sm"
-            onClick={() => handleTabChange('active')}
+            onClick={() => onTabChange('inbox')}
           >
             Inbox
           </Button>
           <Button
-            variant={activeTab === 'queued' && !statusFilter ? 'default' : 'outline'}
+            variant={activeTab === 'queued' ? 'default' : 'outline'}
             size="sm"
-            onClick={() => handleTabChange('queued')}
+            onClick={() => onTabChange('queued')}
           >
             <ListPlus className="mr-2 h-4 w-4" />
             Queued
           </Button>
           <Button
-            variant={activeTab === 'cleaned' && !statusFilter ? 'default' : 'outline'}
+            variant={activeTab === 'cleaned' ? 'default' : 'outline'}
             size="sm"
-            onClick={() => handleTabChange('cleaned')}
+            onClick={() => onTabChange('cleaned')}
           >
             Cleaned
           </Button>
           <Button
-            variant={activeTab === 'ignored' && !statusFilter ? 'default' : 'outline'}
+            variant={activeTab === 'failed' ? 'default' : 'outline'}
             size="sm"
-            onClick={() => handleTabChange('ignored')}
+            onClick={() => onTabChange('failed')}
+          >
+            <AlertCircle className="mr-2 h-4 w-4" />
+            Failed
+          </Button>
+          <Button
+            variant={activeTab === 'ignored' ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => onTabChange('ignored')}
           >
             <EyeOff className="mr-2 h-4 w-4" />
             Ignored
@@ -519,9 +458,9 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         </div>
         {selectedEpisodes.length > 0 && (
           <div className="flex gap-2">
-            {!isIgnoredMode && (
+            {/* Inbox and Failed tabs: Queue and Ignore actions */}
+            {(activeTab === 'inbox' || activeTab === 'failed') && (
               <>
-                {/* Queue - for discovered/failed episodes */}
                 {selectedEpisodes.some((ep) => ep.status === 'discovered' || ep.status === 'failed') && (
                   <Button
                     onClick={handleQueueSelected}
@@ -532,31 +471,6 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                     Queue
                   </Button>
                 )}
-                {/* Unqueue - for queued episodes */}
-                {selectedEpisodes.some((ep) => ep.status === 'queued') && (
-                  <Button
-                    onClick={handleUnqueueSelected}
-                    disabled={unqueueMutation.isPending}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <Undo2 className="mr-2 h-4 w-4" />
-                    Unqueue
-                  </Button>
-                )}
-                {/* Mark Failed - for queued/processing episodes */}
-                {selectedEpisodes.some((ep) => ep.status === 'queued' || ep.status === 'processing') && (
-                  <Button
-                    onClick={handleFailSelected}
-                    disabled={failMutation.isPending}
-                    size="sm"
-                    variant="destructive"
-                  >
-                    <XCircle className="mr-2 h-4 w-4" />
-                    Mark Failed
-                  </Button>
-                )}
-                {/* Ignore - for discovered/failed episodes */}
                 {selectedEpisodes.some((ep) => ep.status === 'discovered' || ep.status === 'failed') && (
                   <Button
                     onClick={handleIgnoreSelected}
@@ -570,6 +484,34 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                 )}
               </>
             )}
+            {/* Queued tab: Unqueue and Mark Failed actions */}
+            {activeTab === 'queued' && (
+              <>
+                {selectedEpisodes.some((ep) => ep.status === 'queued') && (
+                  <Button
+                    onClick={handleUnqueueSelected}
+                    disabled={unqueueMutation.isPending}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <Undo2 className="mr-2 h-4 w-4" />
+                    Unqueue
+                  </Button>
+                )}
+                {selectedEpisodes.some((ep) => ep.status === 'queued' || ep.status === 'processing') && (
+                  <Button
+                    onClick={handleFailSelected}
+                    disabled={failMutation.isPending}
+                    size="sm"
+                    variant="destructive"
+                  >
+                    <XCircle className="mr-2 h-4 w-4" />
+                    Mark Failed
+                  </Button>
+                )}
+              </>
+            )}
+            {/* Ignored tab: Restore action */}
             {isIgnoredMode && (
               <Button
                 onClick={handleUnignoreSelected}
@@ -580,6 +522,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                 Restore ({selectedEpisodes.length})
               </Button>
             )}
+            {/* Cleaned tab: Reprocess action */}
             {isCleanedMode && selectedEpisodes.some((ep) => ep.status === 'cleaned') && (
               <Button
                 onClick={handleReprocessSelected}
@@ -650,7 +593,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                   colSpan={columns.length}
                   className="h-24 text-center"
                 >
-                  {activeTab === 'ignored' ? 'No ignored episodes.' : activeTab === 'cleaned' ? 'No cleaned episodes yet.' : activeTab === 'queued' ? 'No queued episodes.' : 'No episodes in inbox.'}
+                  {activeTab === 'ignored' ? 'No ignored episodes.' : activeTab === 'cleaned' ? 'No cleaned episodes yet.' : activeTab === 'queued' ? 'No queued episodes.' : activeTab === 'failed' ? 'No failed episodes.' : 'No episodes in inbox.'}
                 </TableCell>
               </TableRow>
             )}

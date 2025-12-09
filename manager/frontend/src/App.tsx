@@ -4,7 +4,7 @@ import { Podcast, Inbox } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { FeedView } from '@/components/FeedView'
 import { EpisodeTable } from '@/components/EpisodeTable'
-import { StatusOverview } from '@/components/StatusOverview'
+import { StatusOverview, type EpisodeTab } from '@/components/StatusOverview'
 import { PasswordGate } from '@/components/PasswordGate'
 
 const queryClient = new QueryClient({
@@ -16,15 +16,15 @@ const queryClient = new QueryClient({
   },
 })
 
-type Tab = 'feeds' | 'episodes'
+type MainTab = 'feeds' | 'episodes'
 
 function AppContent() {
-  const [activeTab, setActiveTab] = useState<Tab>('feeds')
-  const [statusFilter, setStatusFilter] = useState<string | null>(null)
+  const [mainTab, setMainTab] = useState<MainTab>('feeds')
+  const [episodeTab, setEpisodeTab] = useState<EpisodeTab>('inbox')
 
-  const handleStatusClick = (status: string | null) => {
-    setStatusFilter(status)
-    setActiveTab('episodes')
+  const handleTabClick = (tab: EpisodeTab) => {
+    setEpisodeTab(tab)
+    setMainTab('episodes')
   }
 
   return (
@@ -36,21 +36,18 @@ function AppContent() {
             <h1 className="text-2xl font-bold">PodcastPurifier</h1>
             <nav className="flex gap-2">
               <Button
-                variant={activeTab === 'feeds' ? 'default' : 'ghost'}
-                onClick={() => setActiveTab('feeds')}
+                variant={mainTab === 'feeds' ? 'default' : 'ghost'}
+                onClick={() => setMainTab('feeds')}
               >
                 <Podcast className="mr-2 h-4 w-4" />
                 Feeds
               </Button>
               <Button
-                variant={activeTab === 'episodes' ? 'default' : 'ghost'}
-                onClick={() => {
-                  setStatusFilter(null)
-                  setActiveTab('episodes')
-                }}
+                variant={mainTab === 'episodes' ? 'default' : 'ghost'}
+                onClick={() => setMainTab('episodes')}
               >
                 <Inbox className="mr-2 h-4 w-4" />
-                Episode Inbox
+                Episodes
               </Button>
             </nav>
           </div>
@@ -59,20 +56,17 @@ function AppContent() {
 
       {/* Main Content */}
       <main className="container mx-auto px-4 py-8">
-        <StatusOverview onStatusClick={handleStatusClick} />
+        <StatusOverview onTabClick={handleTabClick} />
 
-        {activeTab === 'feeds' && (
+        {mainTab === 'feeds' && (
           <div>
             <h2 className="text-xl font-semibold mb-4">Subscribed Podcasts</h2>
             <FeedView />
           </div>
         )}
-        {activeTab === 'episodes' && (
+        {mainTab === 'episodes' && (
           <div>
-            <h2 className="text-xl font-semibold mb-4">
-              {statusFilter ? `${statusFilter.charAt(0).toUpperCase() + statusFilter.slice(1)} Episodes` : 'Episode Inbox'}
-            </h2>
-            <EpisodeTable initialStatusFilter={statusFilter} onClearFilter={() => setStatusFilter(null)} />
+            <EpisodeTable activeTab={episodeTab} onTabChange={setEpisodeTab} />
           </div>
         )}
       </main>

@@ -3,11 +3,13 @@ import { CheckCircle, Clock, Loader2, AlertCircle, Search } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { episodesApi } from '@/lib/api'
 
+export type EpisodeTab = 'inbox' | 'queued' | 'cleaned' | 'ignored' | 'failed'
+
 interface StatusOverviewProps {
-  onStatusClick: (status: string | null) => void
+  onTabClick: (tab: EpisodeTab) => void
 }
 
-export function StatusOverview({ onStatusClick }: StatusOverviewProps) {
+export function StatusOverview({ onTabClick }: StatusOverviewProps) {
   const { data: stats } = useQuery({
     queryKey: ['episode-stats'],
     queryFn: episodesApi.stats,
@@ -16,51 +18,50 @@ export function StatusOverview({ onStatusClick }: StatusOverviewProps) {
 
   if (!stats) return null
 
-  const items = [
+  const items: Array<{
+    label: string
+    count: number
+    icon: typeof Search
+    color: string
+    tab: EpisodeTab
+  }> = [
     {
-      label: 'Discovered',
-      count: stats.discovered,
+      label: 'Inbox',
+      count: stats.discovered + stats.failed,
       icon: Search,
       color: 'text-blue-500',
-      status: 'discovered',
+      tab: 'inbox',
     },
     {
       label: 'Queued',
-      count: stats.queued,
+      count: stats.queued + stats.processing,
       icon: Clock,
       color: 'text-yellow-500',
-      status: 'queued',
-    },
-    {
-      label: 'Processing',
-      count: stats.processing,
-      icon: Loader2,
-      color: 'text-purple-500',
-      status: 'processing',
+      tab: 'queued',
     },
     {
       label: 'Cleaned',
       count: stats.cleaned,
       icon: CheckCircle,
       color: 'text-green-500',
-      status: 'cleaned',
+      tab: 'cleaned',
     },
     {
       label: 'Failed',
       count: stats.failed,
       icon: AlertCircle,
       color: 'text-red-500',
-      status: 'failed',
+      tab: 'failed',
     },
   ]
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
       {items.map((item) => (
         <Card
-          key={item.status}
+          key={item.tab}
           className="cursor-pointer hover:bg-accent transition-colors"
-          onClick={() => onStatusClick(item.status)}
+          onClick={() => onTabClick(item.tab)}
         >
           <CardContent className="p-4">
             <div className="flex items-center gap-3">
