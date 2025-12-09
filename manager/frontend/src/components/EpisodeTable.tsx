@@ -38,7 +38,7 @@ const statusVariantMap: Record<EpisodeStatus, 'default' | 'secondary' | 'destruc
   ignored: 'secondary',
 }
 
-type TabType = 'active' | 'cleaned' | 'ignored'
+type TabType = 'active' | 'queued' | 'cleaned' | 'ignored'
 
 interface EpisodeTableProps {
   initialStatusFilter?: string | null
@@ -57,6 +57,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   const [selectedError, setSelectedError] = useState<{ title: string; error: string } | null>(null)
   const [sortBy, setSortBy] = useState<string>('published_at')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [selectedEpisode, setSelectedEpisode] = useState<Episode | null>(null)
+  const [episodeModalOpen, setEpisodeModalOpen] = useState(false)
 
   // Update status filter when prop changes from parent (StatusOverview click)
   useEffect(() => {
@@ -107,10 +109,22 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         })
       }
 
-      // Active tab: exclude ignored and cleaned
+      if (activeTab === 'queued') {
+        // Queued tab: show queued and processing episodes
+        return episodesApi.list({
+          feed_id: selectedFeedId,
+          exclude_statuses: 'discovered,cleaned,ignored,failed',
+          sort_by: sortBy,
+          sort_order: sortOrder,
+          page,
+          page_size: pageSize,
+        })
+      }
+
+      // Active tab: exclude ignored, cleaned, queued, and processing
       return episodesApi.list({
         feed_id: selectedFeedId,
-        exclude_statuses: 'ignored,cleaned',
+        exclude_statuses: 'ignored,cleaned,queued,processing',
         sort_by: sortBy,
         sort_order: sortOrder,
         page,
@@ -300,6 +314,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   // Determine special modes based on tab or status filter
   const isIgnoredMode = activeTab === 'ignored' || statusFilter === 'ignored'
   const isCleanedMode = activeTab === 'cleaned' || statusFilter === 'cleaned'
+  const isQueuedMode = activeTab === 'queued' || statusFilter === 'queued' || statusFilter === 'processing'
 
   const coreRowModel = useMemo(() => getCoreRowModel(), [])
 
@@ -429,7 +444,15 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
             size="sm"
             onClick={() => handleTabChange('active')}
           >
-            Active
+            Inbox
+          </Button>
+          <Button
+            variant={activeTab === 'queued' && !statusFilter ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => handleTabChange('queued')}
+          >
+            <ListPlus className="mr-2 h-4 w-4" />
+            Queued
           </Button>
           <Button
             variant={activeTab === 'cleaned' && !statusFilter ? 'default' : 'outline'}
@@ -569,6 +592,20 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                 <TableRow
                   key={row.id}
                   data-state={row.getIsSelected() && 'selected'}
+                  className="cursor-pointer hover:bg-muted/50"
+                  onClick={(e) => {
+                    // Don't open modal if clicking on checkbox, button, or link
+                    const target = e.target as HTMLElement
+                    if (
+                      target.closest('button') ||
+                      target.closest('input') ||
+                      target.closest('a')
+                    ) {
+                      return
+                    }
+                    setSelectedEpisode(row.original)
+                    setEpisodeModalOpen(true)
+                  }}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id}>
@@ -586,7 +623,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                   colSpan={columns.length}
                   className="h-24 text-center"
                 >
-                  {activeTab === 'ignored' ? 'No ignored episodes.' : activeTab === 'cleaned' ? 'No cleaned episodes yet.' : 'No episodes found.'}
+                  {activeTab === 'ignored' ? 'No ignored episodes.' : activeTab === 'cleaned' ? 'No cleaned episodes yet.' : activeTab === 'queued' ? 'No queued episodes.' : 'No episodes in inbox.'}
                 </TableCell>
               </TableRow>
             )}
@@ -640,6 +677,96 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                 <pre className="mt-2 p-4 bg-muted rounded-md text-sm overflow-auto max-h-[400px] whitespace-pre-wrap font-mono">
                   {selectedError.error}
                 </pre>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Episode Details Modal */}
+      <Dialog open={episodeModalOpen} onOpenChange={setEpisodeModalOpen}>
+        <DialogContent>
+          <DialogHeader onClose={() => setEpisodeModalOpen(false)}>
+            <DialogTitle>Episode Details</DialogTitle>
+          </DialogHeader>
+          {selectedEpisode && (
+            <div className="space-y-4">
+              <div>
+                <span className="text-sm text-muted-foreground">Title</span>
+                <p className="font-medium">{selectedEpisode.title}</p>
+              </div>
+
+              <div>
+                <span className="text-sm text-muted-foreground">Podcast</span>
+                <p>{selectedEpisode.feed_title}</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <span className="text-sm text-muted-foreground">Status</span>
+                  <div className="mt-1">
+                    <Badge variant={statusVariantMap[selectedEpisode.status]}>
+                      {selectedEpisode.status.charAt(0).toUpperCase() + selectedEpisode.status.slice(1)}
+                    </Badge>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-sm text-muted-foreground">Published</span>
+                  <p>
+                    {selectedEpisode.published_at
+                      ? format(new Date(selectedEpisode.published_at), 'MMM d, yyyy h:mm a')
+                      : '—'}
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <span className="text-sm text-muted-foreground">GUID</span>
+                <p className="text-sm font-mono break-all bg-muted p-2 rounded">{selectedEpisode.guid}</p>
+              </div>
+
+              <div>
+                <span className="text-sm text-muted-foreground">Source Audio URL</span>
+                <p className="text-sm font-mono break-all bg-muted p-2 rounded">
+                  <a
+                    href={selectedEpisode.audio_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:underline"
+                  >
+                    {selectedEpisode.audio_url}
+                  </a>
+                </p>
+              </div>
+
+              {selectedEpisode.local_filename && (
+                <div>
+                  <span className="text-sm text-muted-foreground">Cleaned File</span>
+                  <p className="text-sm font-mono break-all bg-muted p-2 rounded">
+                    {selectedEpisode.local_filename}
+                  </p>
+                </div>
+              )}
+
+              {selectedEpisode.error_message && (
+                <div>
+                  <span className="text-sm text-muted-foreground">Error</span>
+                  <pre className="mt-1 p-3 bg-destructive/10 text-destructive rounded-md text-sm overflow-auto max-h-[200px] whitespace-pre-wrap font-mono">
+                    {selectedEpisode.error_message}
+                  </pre>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-4 pt-2 border-t text-sm text-muted-foreground">
+                <div>
+                  <span>Created:</span>{' '}
+                  {format(new Date(selectedEpisode.created_at), 'MMM d, yyyy h:mm a')}
+                </div>
+                <div>
+                  <span>Updated:</span>{' '}
+                  {format(new Date(selectedEpisode.updated_at), 'MMM d, yyyy h:mm a')}
+                </div>
               </div>
             </div>
           )}
