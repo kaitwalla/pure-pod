@@ -173,17 +173,19 @@ Analyze this podcast transcript and identify ALL advertisement segments:
     # Parse the JSON response
     ad_segments = []
     try:
-        # Extract JSON array from response
-        json_match = re.search(r'\[.*?\]', response, re.DOTALL)
+        # Extract JSON array from response - use greedy match to get the full array
+        json_match = re.search(r'\[.*\]', response, re.DOTALL)
         if json_match:
             segments_data = json.loads(json_match.group())
             for seg in segments_data:
                 start_ms = float(seg["start"]) * 1000
                 end_ms = float(seg["end"]) * 1000
                 ad_segments.append((start_ms, end_ms))
-    except (json.JSONDecodeError, KeyError, TypeError):
-        # If parsing fails, return empty list (no ads removed)
-        pass
+        else:
+            print(f"[AD_DETECTION] No JSON array found in LLM response: {response[:500]}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"[AD_DETECTION] Failed to parse LLM response: {e}")
+        print(f"[AD_DETECTION] Raw response: {response[:500]}")
 
     return ad_segments
 

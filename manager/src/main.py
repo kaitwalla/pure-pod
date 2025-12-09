@@ -723,6 +723,53 @@ async def fail_episodes(
     return {"failed": failed_count}
 
 
+@api.post("/episodes/reprocess")
+async def reprocess_episodes(
+    request: BulkEpisodeRequest,
+    session: Session = Depends(get_db_session),
+):
+    """
+    Reprocess cleaned episodes.
+
+    Deletes the existing cleaned audio file and re-queues the episode
+    for processing from the original source.
+    """
+    from .storage import delete_audio_file
+
+    reprocessed_count = 0
+    dispatched_tasks = []
+
+    for episode_id in request.episode_ids:
+        episode = session.get(Episode, episode_id)
+        if episode and episode.status == EpisodeStatus.CLEANED:
+            # Delete the existing cleaned audio file
+            if episode.local_filename:
+                try:
+                    delete_audio_file(episode.local_filename)
+                    logger.info(f"Deleted cleaned audio for episode {episode_id}: {episode.local_filename}")
+                except Exception as e:
+                    logger.error(f"Failed to delete audio file for episode {episode_id}: {e}")
+
+            # Reset episode state
+            episode.local_filename = None
+            episode.status = EpisodeStatus.QUEUED
+            episode.error_message = None
+            episode.updated_at = datetime.utcnow()
+            session.add(episode)
+            reprocessed_count += 1
+
+            # Dispatch to Worker
+            try:
+                task_id = dispatch_episode_processing(episode_id, episode.audio_url)
+                dispatched_tasks.append({"episode_id": episode_id, "task_id": task_id})
+            except Exception as e:
+                logger.error(f"Failed to dispatch episode {episode_id}: {e}")
+
+    session.commit()
+
+    return {"reprocessed": reprocessed_count, "tasks": dispatched_tasks}
+
+
 class EpisodeStatusUpdate(BaseModel):
     status: str  # processing, failed, etc.
     stage: str | None = None  # downloading, transcribing, analyzing, cutting, uploading

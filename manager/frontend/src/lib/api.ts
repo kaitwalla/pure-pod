@@ -95,5 +95,11 @@ export const episodesApi = {
       body: JSON.stringify({ episode_ids: episodeIds }),
     }),
 
+  reprocessBulk: (episodeIds: number[]) =>
+    fetchAPI<{ reprocessed: number }>('/episodes/reprocess', {
+      method: 'POST',
+      body: JSON.stringify({ episode_ids: episodeIds }),
+    }),
+
   stats: () => fetchAPI<EpisodeStats>('/episodes/stats'),
 }

@@ -8,7 +8,7 @@ import {
   type RowSelectionState,
 } from '@tanstack/react-table'
 import { format } from 'date-fns'
-import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, X, Undo2, XCircle, AlertCircle, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
+import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, X, Undo2, XCircle, AlertCircle, ArrowUp, ArrowDown, ArrowUpDown, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -185,6 +185,15 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
     },
   })
 
+  const reprocessMutation = useMutation({
+    mutationFn: episodesApi.reprocessBulk,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['episodes'] })
+      queryClient.invalidateQueries({ queryKey: ['stats'] })
+      setRowSelection({})
+    },
+  })
+
   const handleSort = (column: string) => {
     if (sortBy === column) {
       setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
@@ -326,7 +335,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
     enableRowSelection: (row) => {
       const status = row.original.status
       if (isCleanedMode) {
-        return false // No bulk actions on cleaned episodes
+        return status === 'cleaned' // Allow selecting cleaned episodes for reprocessing
       }
       if (isIgnoredMode) {
         return status === 'ignored'
@@ -371,6 +380,15 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       .map((ep) => ep.id)
     if (ids.length > 0) {
       failMutation.mutate(ids)
+    }
+  }
+
+  const handleReprocessSelected = () => {
+    const ids = selectedEpisodes
+      .filter((ep) => ep.status === 'cleaned')
+      .map((ep) => ep.id)
+    if (ids.length > 0) {
+      reprocessMutation.mutate(ids)
     }
   }
 
@@ -560,6 +578,16 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
               >
                 <Eye className="mr-2 h-4 w-4" />
                 Restore ({selectedEpisodes.length})
+              </Button>
+            )}
+            {isCleanedMode && selectedEpisodes.some((ep) => ep.status === 'cleaned') && (
+              <Button
+                onClick={handleReprocessSelected}
+                disabled={reprocessMutation.isPending}
+                size="sm"
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Reprocess ({selectedEpisodes.filter((ep) => ep.status === 'cleaned').length})
               </Button>
             )}
           </div>
