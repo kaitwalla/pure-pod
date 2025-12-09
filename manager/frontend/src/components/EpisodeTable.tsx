@@ -8,7 +8,7 @@ import {
   type RowSelectionState,
 } from '@tanstack/react-table'
 import { format } from 'date-fns'
-import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, X, Undo2, XCircle, AlertCircle } from 'lucide-react'
+import { ListPlus, EyeOff, Eye, ChevronLeft, ChevronRight, X, Undo2, XCircle, AlertCircle, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -55,6 +55,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   const pageSize = 25
   const [errorModalOpen, setErrorModalOpen] = useState(false)
   const [selectedError, setSelectedError] = useState<{ title: string; error: string } | null>(null)
+  const [sortBy, setSortBy] = useState<string>('published_at')
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
 
   // Update status filter when prop changes from parent (StatusOverview click)
   useEffect(() => {
@@ -68,13 +70,15 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
   }, [initialStatusFilter])
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['episodes', selectedFeedId, activeTab, statusFilter, page],
+    queryKey: ['episodes', selectedFeedId, activeTab, statusFilter, sortBy, sortOrder, page],
     queryFn: () => {
       // If we have a specific status filter from StatusOverview, use that
       if (statusFilter) {
         return episodesApi.list({
           feed_id: selectedFeedId,
           status: statusFilter,
+          sort_by: sortBy,
+          sort_order: sortOrder,
           page,
           page_size: pageSize,
         })
@@ -85,6 +89,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         return episodesApi.list({
           feed_id: selectedFeedId,
           status: 'ignored',
+          sort_by: sortBy,
+          sort_order: sortOrder,
           page,
           page_size: pageSize,
         })
@@ -94,6 +100,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         return episodesApi.list({
           feed_id: selectedFeedId,
           status: 'cleaned',
+          sort_by: sortBy,
+          sort_order: sortOrder,
           page,
           page_size: pageSize,
         })
@@ -103,6 +111,8 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       return episodesApi.list({
         feed_id: selectedFeedId,
         exclude_statuses: 'ignored,cleaned',
+        sort_by: sortBy,
+        sort_order: sortOrder,
         page,
         page_size: pageSize,
       })
@@ -161,6 +171,34 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
     },
   })
 
+  const handleSort = (column: string) => {
+    if (sortBy === column) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(column)
+      setSortOrder('desc')
+    }
+    setPage(1)
+  }
+
+  const SortableHeader = ({ column, label }: { column: string; label: string }) => (
+    <button
+      onClick={() => handleSort(column)}
+      className="flex items-center gap-1 hover:text-foreground transition-colors"
+    >
+      {label}
+      {sortBy === column ? (
+        sortOrder === 'asc' ? (
+          <ArrowUp className="h-4 w-4" />
+        ) : (
+          <ArrowDown className="h-4 w-4" />
+        )
+      ) : (
+        <ArrowUpDown className="h-4 w-4 opacity-50" />
+      )}
+    </button>
+  )
+
   const columns = useMemo<ColumnDef<Episode>[]>(
     () => [
       {
@@ -196,7 +234,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       },
       {
         accessorKey: 'title',
-        header: 'Episode',
+        header: () => <SortableHeader column="title" label="Episode" />,
         cell: ({ row }) => (
           <div className="max-w-md truncate font-medium" title={row.original.title}>
             {row.original.title}
@@ -205,7 +243,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       },
       {
         accessorKey: 'published_at',
-        header: 'Published',
+        header: () => <SortableHeader column="published_at" label="Published" />,
         cell: ({ row }) => {
           const date = row.original.published_at
           if (!date) return <span className="text-muted-foreground">—</span>
@@ -214,7 +252,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
       },
       {
         accessorKey: 'status',
-        header: 'Status',
+        header: () => <SortableHeader column="status" label="Status" />,
         cell: ({ row }) => {
           const status = row.original.status
           const errorMessage = row.original.error_message
@@ -256,7 +294,7 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
         },
       },
     ],
-    [setSelectedError, setErrorModalOpen]
+    [setSelectedError, setErrorModalOpen, sortBy, sortOrder]
   )
 
   // Determine special modes based on tab or status filter

@@ -472,6 +472,8 @@ async def list_episodes(
     feed_id: int = None,
     status: EpisodeStatus = None,
     exclude_statuses: str = None,
+    sort_by: str = "published_at",
+    sort_order: str = "desc",
     page: int = 1,
     page_size: int = 25,
     session: Session = Depends(get_db_session),
@@ -490,8 +492,20 @@ async def list_episodes(
         for exc_status in excluded:
             query = query.where(Episode.status != exc_status)
 
-    # Order by published date (newest first), fallback to created_at
-    query = query.order_by(Episode.published_at.desc().nullslast(), Episode.created_at.desc())
+    # Determine sort column
+    sort_columns = {
+        "published_at": Episode.published_at,
+        "title": Episode.title,
+        "status": Episode.status,
+        "created_at": Episode.created_at,
+    }
+    sort_column = sort_columns.get(sort_by, Episode.published_at)
+
+    # Apply sort order
+    if sort_order == "asc":
+        query = query.order_by(sort_column.asc().nullslast())
+    else:
+        query = query.order_by(sort_column.desc().nullslast())
 
     # Get total count
     count_query = select(Episode)
@@ -637,6 +651,7 @@ async def queue_episodes(
         episode = session.get(Episode, episode_id)
         if episode and episode.status in (EpisodeStatus.DISCOVERED, EpisodeStatus.FAILED):
             episode.status = EpisodeStatus.QUEUED
+            episode.error_message = None  # Clear any previous error
             episode.updated_at = datetime.utcnow()
             session.add(episode)
             queued_count += 1

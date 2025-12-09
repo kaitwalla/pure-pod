@@ -5,6 +5,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
+# Suppress tokenizers parallelism warning (must be before any HF imports)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -135,13 +138,16 @@ HOST-READ ADS (the host talks about a product/service):
 - Detailed product descriptions with specific benefits
 - Mentioning getting a "special deal" or "worked out a deal"
 
-PRE-ROLL ADS (at the very beginning, before the actual episode):
+PRE-ROLL ADS (at the very beginning, before the actual episode - BE AGGRESSIVE HERE):
+- The first 0-180 seconds often contain ads BEFORE the actual show starts
 - Content at the start that's unrelated to the episode topic
-- Network/studio promos ("From Wondery", "A Spotify Original", "From the makers of")
-- Promos for other podcasts ("If you like this show, check out...")
+- Network/studio promos ("From Wondery", "A Spotify Original", "From the makers of", "iHeart", "Pushkin")
+- Promos for other podcasts ("If you like this show, check out...", "New from...")
 - Sponsor messages before any episode content
 - Generic intros immediately followed by ads
-- The actual episode usually starts with: the host greeting, episode topic introduction, or theme music
+- Dynamically inserted ads (often sound slightly different in audio quality)
+- If the first segment mentions ANY product, service, or other podcast - it's probably an ad
+- The actual episode usually starts with: the host greeting by name, episode topic introduction, or consistent theme music
 
 Respond ONLY with a JSON array of ad segments. Each segment should have "start" and "end" times in seconds.
 If there are no ads, respond with an empty array: []
@@ -299,7 +305,10 @@ def process_episode(self, episode_id: str, audio_url: str, callback_url: str) ->
             state="DOWNLOADING",
             meta={"episode_id": episode_id, "step": "downloading audio"},
         )
-        response = requests.get(audio_url, stream=True, timeout=600)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        response = requests.get(audio_url, stream=True, timeout=600, headers=headers)
         response.raise_for_status()
 
         with open(input_path, "wb") as f:
