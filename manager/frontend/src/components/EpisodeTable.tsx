@@ -690,17 +690,22 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
           </DialogHeader>
           {selectedEpisode && (
             <div className="space-y-4">
-              <div>
-                <span className="text-sm text-muted-foreground">Title</span>
-                <p className="font-medium">{selectedEpisode.title}</p>
+              {/* Header with image */}
+              <div className="flex gap-4">
+                {selectedEpisode.image_url && (
+                  <img
+                    src={selectedEpisode.image_url}
+                    alt=""
+                    className="w-20 h-20 rounded object-cover flex-shrink-0"
+                  />
+                )}
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium">{selectedEpisode.title}</p>
+                  <p className="text-sm text-muted-foreground">{selectedEpisode.feed_title}</p>
+                </div>
               </div>
 
-              <div>
-                <span className="text-sm text-muted-foreground">Podcast</span>
-                <p>{selectedEpisode.feed_title}</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-3 gap-4">
                 <div>
                   <span className="text-sm text-muted-foreground">Status</span>
                   <div className="mt-1">
@@ -714,11 +719,30 @@ export function EpisodeTable({ initialStatusFilter, onClearFilter }: EpisodeTabl
                   <span className="text-sm text-muted-foreground">Published</span>
                   <p>
                     {selectedEpisode.published_at
-                      ? format(new Date(selectedEpisode.published_at), 'MMM d, yyyy h:mm a')
+                      ? format(new Date(selectedEpisode.published_at), 'MMM d, yyyy')
+                      : '—'}
+                  </p>
+                </div>
+
+                <div>
+                  <span className="text-sm text-muted-foreground">Duration</span>
+                  <p>
+                    {selectedEpisode.duration
+                      ? `${Math.floor(selectedEpisode.duration / 60)}m ${selectedEpisode.duration % 60}s`
                       : '—'}
                   </p>
                 </div>
               </div>
+
+              {selectedEpisode.description && (
+                <div>
+                  <span className="text-sm text-muted-foreground">Description</span>
+                  <div
+                    className="mt-1 text-sm max-h-[150px] overflow-auto prose prose-sm dark:prose-invert"
+                    dangerouslySetInnerHTML={{ __html: selectedEpisode.description }}
+                  />
+                </div>
+              )}
 
               <div>
                 <span className="text-sm text-muted-foreground">GUID</span>

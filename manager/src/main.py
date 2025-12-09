@@ -450,7 +450,10 @@ class EpisodeWithFeed(BaseModel):
     guid: str
     status: EpisodeStatus
     title: str
+    description: str | None
     audio_url: str
+    duration: int | None
+    image_url: str | None
     published_at: datetime | None
     local_filename: str | None
     error_message: str | None
@@ -541,7 +544,10 @@ async def list_episodes(
             guid=ep.guid,
             status=ep.status,
             title=ep.title,
+            description=ep.description,
             audio_url=ep.audio_url,
+            duration=ep.duration,
+            image_url=ep.image_url,
             published_at=ep.published_at,
             local_filename=ep.local_filename,
             error_message=ep.error_message,

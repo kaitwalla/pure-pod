@@ -20,7 +20,10 @@ export interface Episode {
   guid: string
   status: EpisodeStatus
   title: string
+  description: string | null
   audio_url: string
+  duration: number | null
+  image_url: string | null
   published_at: string | null
   local_filename: string | null
   error_message: string | null
