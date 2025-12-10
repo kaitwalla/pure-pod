@@ -48,7 +48,7 @@ on startWorkerDetached()
 	end if
 
 	-- Start the worker detached in background (logs go to file)
-	do shell script "cd " & quoted form of workerPath & " && source .venv/bin/activate && nohup celery -A worker.main worker --loglevel=info --pool=solo > worker.log 2>&1 &"
+	do shell script "DYLD_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg/lib && cd " & quoted form of workerPath & " && source .venv/bin/activate && nohup celery -A worker.main worker --loglevel=info --pool=solo > worker.log 2>&1 &"
 
 	display notification "Worker started (detached)" with title "PurePod"
 end startWorkerDetached
@@ -65,7 +65,7 @@ on startWorkerDebug()
 	-- Start the worker in a new Terminal window for debugging
 	tell application "Terminal"
 		activate
-		set newWindow to do script "cd " & quoted form of workerPath & " && source .venv/bin/activate && celery -A worker.main worker --loglevel=info --pool=solo"
+		set newWindow to do script "DYLD_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg/lib && cd " & quoted form of workerPath & " && source .venv/bin/activate && celery -A worker.main worker --loglevel=info --pool=solo"
 	end tell
 
 	display notification "Worker started (debug mode)" with title "PurePod"
