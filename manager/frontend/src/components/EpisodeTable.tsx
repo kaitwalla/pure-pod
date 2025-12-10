@@ -717,7 +717,15 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
                   <span className="text-sm text-muted-foreground">Duration</span>
                   <p>
                     {selectedEpisode.duration
-                      ? `${Math.floor(selectedEpisode.duration / 60)}m ${selectedEpisode.duration % 60}s`
+                      ? (() => {
+                          const hours = Math.floor(selectedEpisode.duration / 3600)
+                          const minutes = Math.floor((selectedEpisode.duration % 3600) / 60)
+                          const seconds = selectedEpisode.duration % 60
+                          if (hours > 0) {
+                            return `${hours}h ${minutes}m ${seconds}s`
+                          }
+                          return `${minutes}m ${seconds}s`
+                        })()
                       : '—'}
                   </p>
                 </div>

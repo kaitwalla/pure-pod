@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import List, Set
 
 import aiofiles
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, WebSocket, WebSocketDisconnect, APIRouter
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, WebSocket, WebSocketDisconnect, APIRouter, Header
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from .config import AUDIO_STORAGE_PATH, PUBLIC_HOSTNAME
+from .config import AUDIO_STORAGE_PATH, PUBLIC_HOSTNAME, WORKER_API_KEY
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 from .database import init_db, engine
@@ -67,17 +67,52 @@ async def task_status_sync_loop():
             await asyncio.sleep(30)  # Wait longer on error
 
 
+FEED_CHECK_INTERVAL = 4 * 60 * 60  # 4 hours in seconds
+
+
+async def feed_refresh_loop():
+    """Background loop that checks all feeds for new episodes every 4 hours."""
+    # Wait a bit on startup to let things settle
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            logger.info("[FEED REFRESH] Checking all feeds for new episodes...")
+            with Session(engine) as session:
+                feeds = session.exec(select(Feed)).all()
+                total_new = 0
+                for feed in feeds:
+                    try:
+                        new_episodes = ingest_feed(feed.id, session)
+                        if new_episodes:
+                            logger.info(f"[FEED REFRESH] Feed '{feed.title}': {len(new_episodes)} new episodes")
+                            total_new += len(new_episodes)
+                    except Exception as e:
+                        logger.error(f"[FEED REFRESH] Error checking feed {feed.id} ({feed.title}): {e}")
+                logger.info(f"[FEED REFRESH] Complete. {total_new} new episodes across {len(feeds)} feeds.")
+        except Exception as e:
+            logger.error(f"[FEED REFRESH] Error in feed refresh loop: {e}")
+
+        await asyncio.sleep(FEED_CHECK_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize database on startup and start background tasks."""
     init_db()
-    # Start background task sync loop
+    # Start background tasks
     sync_task = asyncio.create_task(task_status_sync_loop())
+    feed_task = asyncio.create_task(feed_refresh_loop())
     yield
-    # Cancel background task on shutdown
+    # Cancel background tasks on shutdown
     sync_task.cancel()
+    feed_task.cancel()
     try:
         await sync_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await feed_task
     except asyncio.CancelledError:
         pass
 
@@ -150,6 +185,7 @@ async def upload_cleaned_audio(
     episode_id: int,
     file: UploadFile = File(...),
     session: Session = Depends(get_db_session),
+    x_api_key: str = Header(..., alias="X-API-Key"),
 ):
     """
     Upload a cleaned MP3 file from the Worker.
@@ -157,7 +193,13 @@ async def upload_cleaned_audio(
     This endpoint allows the Worker to upload the final cleaned MP3
     back to the Manager after processing. Files are stored either
     locally or in S3-compatible storage based on configuration.
+
+    Requires X-API-Key header matching WORKER_API_KEY env var.
     """
+    if not WORKER_API_KEY:
+        raise HTTPException(status_code=500, detail="WORKER_API_KEY not configured on server")
+    if x_api_key != WORKER_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     from .storage import save_audio_file
 
     episode = session.get(Episode, episode_id)

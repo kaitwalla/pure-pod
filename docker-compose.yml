@@ -26,6 +26,8 @@ services:
       - S3_SECRET_KEY=${S3_SECRET_KEY:-}
       - S3_REGION=${S3_REGION:-nyc3}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-}
+      # Worker authentication for upload endpoint
+      - WORKER_API_KEY=${WORKER_API_KEY:-}
     volumes:
       - audio_files:/app/audio
     depends_on:

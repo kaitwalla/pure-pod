@@ -16,5 +16,8 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
 S3_REGION = os.getenv("S3_REGION", "nyc3")
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "")  # e.g., https://bucket.nyc3.cdn.digitaloceanspaces.com
 
+# Worker authentication - required for upload endpoint
+WORKER_API_KEY = os.getenv("WORKER_API_KEY", "")
+
 # Ensure audio storage directory exists (for local storage or temp files)
 AUDIO_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
