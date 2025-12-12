@@ -725,6 +725,8 @@ async def queue_episodes(
             episode.error_message = None  # Clear any previous error
             episode.updated_at = datetime.utcnow()
             session.add(episode)
+            # Commit immediately so worker sees QUEUED status (prevents race condition)
+            session.commit()
             queued_count += 1
 
             # Dispatch to Worker
@@ -733,8 +735,6 @@ async def queue_episodes(
                 dispatched_tasks.append({"episode_id": episode_id, "task_id": task_id})
             except Exception as e:
                 logger.error(f"Failed to dispatch episode {episode_id}: {e}")
-
-    session.commit()
 
     return {"queued": queued_count, "tasks": dispatched_tasks}
 
@@ -821,6 +821,8 @@ async def reprocess_episodes(
             episode.error_message = None
             episode.updated_at = datetime.utcnow()
             session.add(episode)
+            # Commit immediately so worker sees QUEUED status (prevents race condition)
+            session.commit()
             reprocessed_count += 1
 
             # Dispatch to Worker
@@ -829,8 +831,6 @@ async def reprocess_episodes(
                 dispatched_tasks.append({"episode_id": episode_id, "task_id": task_id})
             except Exception as e:
                 logger.error(f"Failed to dispatch episode {episode_id}: {e}")
-
-    session.commit()
 
     return {"reprocessed": reprocessed_count, "tasks": dispatched_tasks}
 
