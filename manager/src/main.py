@@ -96,10 +96,31 @@ async def feed_refresh_loop():
         await asyncio.sleep(FEED_CHECK_INTERVAL)
 
 
+def dispatch_queued_episodes():
+    """Dispatch any QUEUED episodes that may have been missed (e.g., after restart)."""
+    with Session(engine) as session:
+        queued_episodes = session.exec(
+            select(Episode).where(Episode.status == EpisodeStatus.QUEUED)
+        ).all()
+
+        if queued_episodes:
+            logger.info(f"[STARTUP] Found {len(queued_episodes)} queued episodes to dispatch")
+            for ep in queued_episodes:
+                try:
+                    task_id = dispatch_episode_processing(ep.id, ep.audio_url)
+                    logger.info(f"[STARTUP] Dispatched episode {ep.id} '{ep.title}', task_id={task_id}")
+                except Exception as e:
+                    logger.error(f"[STARTUP] Failed to dispatch episode {ep.id}: {e}")
+        else:
+            logger.info("[STARTUP] No queued episodes to dispatch")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize database on startup and start background tasks."""
     init_db()
+    # Dispatch any queued episodes that weren't dispatched
+    dispatch_queued_episodes()
     # Start background tasks
     sync_task = asyncio.create_task(task_status_sync_loop())
     feed_task = asyncio.create_task(feed_refresh_loop())

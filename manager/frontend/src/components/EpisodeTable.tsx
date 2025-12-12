@@ -286,6 +286,8 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
 
   const coreRowModel = useMemo(() => getCoreRowModel(), [])
 
+  const isQueuedMode = activeTab === 'queued'
+
   const table = useReactTable({
     data: episodes,
     columns,
@@ -302,6 +304,9 @@ export function EpisodeTable({ activeTab, onTabChange }: EpisodeTableProps) {
       }
       if (isFailedMode) {
         return status === 'failed' // Allow selecting failed episodes to queue or ignore
+      }
+      if (isQueuedMode) {
+        return status === 'queued' || status === 'processing' // Allow selecting queued/processing to fail
       }
       // Allow selecting discovered episodes in inbox
       return status === 'discovered'

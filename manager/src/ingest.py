@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 
 from .models import Feed, Episode, EpisodeStatus
 from .database import get_session
+from .tasks import dispatch_episode_processing
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,15 @@ def ingest_feed(feed_id: int, session: Optional[Session] = None) -> List[Episode
             # Refresh to get IDs
             for ep in new_episodes:
                 session.refresh(ep)
+
+            # Dispatch QUEUED episodes to worker
+            for ep in new_episodes:
+                if ep.status == EpisodeStatus.QUEUED:
+                    try:
+                        task_id = dispatch_episode_processing(ep.id, ep.audio_url)
+                        logger.info(f"Dispatched episode {ep.id} '{ep.title}' to worker, task_id={task_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to dispatch episode {ep.id}: {e}")
 
         return new_episodes
 
