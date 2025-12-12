@@ -264,7 +264,9 @@ def ingest_feed(feed_id: int, session: Optional[Session] = None) -> List[Episode
             for ep in new_episodes:
                 if ep.status == EpisodeStatus.QUEUED:
                     try:
-                        task_id = dispatch_episode_processing(ep.id, ep.audio_url)
+                        task_id = dispatch_episode_processing(
+                            ep.id, ep.audio_url, title=ep.title, description=ep.description
+                        )
                         logger.info(f"Dispatched episode {ep.id} '{ep.title}' to worker, task_id={task_id}")
                     except Exception as e:
                         logger.error(f"Failed to dispatch episode {ep.id}: {e}")

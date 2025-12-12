@@ -107,7 +107,9 @@ def dispatch_queued_episodes():
             logger.info(f"[STARTUP] Found {len(queued_episodes)} queued episodes to dispatch")
             for ep in queued_episodes:
                 try:
-                    task_id = dispatch_episode_processing(ep.id, ep.audio_url)
+                    task_id = dispatch_episode_processing(
+                        ep.id, ep.audio_url, title=ep.title, description=ep.description
+                    )
                     logger.info(f"[STARTUP] Dispatched episode {ep.id} '{ep.title}', task_id={task_id}")
                 except Exception as e:
                     logger.error(f"[STARTUP] Failed to dispatch episode {ep.id}: {e}")
@@ -731,7 +733,10 @@ async def queue_episodes(
 
             # Dispatch to Worker
             try:
-                task_id = dispatch_episode_processing(episode_id, episode.audio_url)
+                task_id = dispatch_episode_processing(
+                    episode_id, episode.audio_url,
+                    title=episode.title, description=episode.description
+                )
                 dispatched_tasks.append({"episode_id": episode_id, "task_id": task_id})
             except Exception as e:
                 logger.error(f"Failed to dispatch episode {episode_id}: {e}")
@@ -827,7 +832,10 @@ async def reprocess_episodes(
 
             # Dispatch to Worker
             try:
-                task_id = dispatch_episode_processing(episode_id, episode.audio_url)
+                task_id = dispatch_episode_processing(
+                    episode_id, episode.audio_url,
+                    title=episode.title, description=episode.description
+                )
                 dispatched_tasks.append({"episode_id": episode_id, "task_id": task_id})
             except Exception as e:
                 logger.error(f"Failed to dispatch episode {episode_id}: {e}")

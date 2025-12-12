@@ -32,13 +32,20 @@ celery_app.conf.update(
 )
 
 
-def dispatch_episode_processing(episode_id: int, audio_url: str) -> str:
+def dispatch_episode_processing(
+    episode_id: int,
+    audio_url: str,
+    title: str | None = None,
+    description: str | None = None,
+) -> str:
     """
     Dispatch an episode for processing by the Worker.
 
     Args:
         episode_id: The episode ID in the database.
         audio_url: URL to download the original audio.
+        title: Episode title (used for ad detection context).
+        description: Episode description/show notes (used for ad detection context).
 
     Returns:
         The Celery task ID.
@@ -48,6 +55,7 @@ def dispatch_episode_processing(episode_id: int, audio_url: str) -> str:
     task = celery_app.send_task(
         "worker.process_episode",
         args=[episode_id, audio_url, callback_url],
+        kwargs={"title": title, "description": description},
         queue="audio_processing",
     )
 

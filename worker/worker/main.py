@@ -283,14 +283,25 @@ def merge_transcript_with_diarization(
     return transcript
 
 
-def detect_ad_segments(transcript: dict) -> list[tuple[float, float]]:
+def detect_ad_segments(
+    transcript: dict,
+    title: str | None = None,
+    description: str | None = None,
+) -> list[tuple[float, float]]:
     """
-    Detect ad segments using a content-first approach:
-    1. Find all URLs/promo codes (deterministic)
-    2. Summarize the episode content (LLM)
-    3. Use summary + URLs to find ad boundaries (LLM)
+    Detect ad segments using a 3-pass approach:
 
-    Returns list of (start_ms, end_ms) tuples for ad segments.
+    Pass 1: Find brand ads (URLs, promo codes, sponsor phrases)
+    Pass 2: Find incongruous content (doesn't match episode description or surrounding content)
+    Pass 3: Verify and refine start/end boundaries
+
+    Args:
+        transcript: Whisper transcript with segments
+        title: Episode title from RSS feed
+        description: Episode description/show notes from RSS feed
+
+    Returns:
+        List of (start_ms, end_ms) tuples for ad segments.
     """
     model, tokenizer = get_llm()
 
@@ -298,41 +309,83 @@ def detect_ad_segments(transcript: dict) -> list[tuple[float, float]]:
     if not segments:
         return []
 
-    # === STEP 1: Find all URLs and promo codes (deterministic) ===
-    url_segments = _find_url_segments(segments)
+    # Build episode context from metadata
+    episode_context = _build_episode_context(title, description)
 
-    # === STEP 2: Summarize episode content (LLM) ===
-    episode_summary = _summarize_episode_content(segments, model, tokenizer)
+    # === PASS 1: Find brand ads (URLs, promo codes, sponsor phrases) ===
+    pass1_ads = _pass1_find_brand_ads(segments, episode_context, model, tokenizer)
 
-    # === STEP 3: Scan for ALL ads using summary (catches brand ads without URLs) ===
-    ad_segments = _find_all_ads_with_summary(segments, episode_summary, model, tokenizer)
+    # === PASS 2: Find incongruous content ===
+    pass2_ads = _pass2_find_incongruous_content(segments, episode_context, pass1_ads, model, tokenizer)
 
-    # === STEP 4: For each URL group, refine boundaries (LLM) ===
-    if not url_segments:
-        if ad_segments:
-            ad_segments = merge_overlapping_segments(ad_segments)
-        return ad_segments
+    # Combine pass 1 and pass 2 results
+    all_ads = pass1_ads + pass2_ads
+    if all_ads:
+        all_ads = merge_overlapping_segments(all_ads)
 
-    # Group nearby URLs (within 2 minutes) as they're likely the same ad block
-    url_groups = []
-    current_group = [url_segments[0]]
+    # === PASS 3: Verify and refine boundaries ===
+    if all_ads:
+        all_ads = _pass3_verify_boundaries(segments, episode_context, all_ads, model, tokenizer)
 
-    for url_seg in url_segments[1:]:
-        # If this URL is within 2 minutes of the last one in current group, add to group
-        if url_seg["start"] - current_group[-1]["end"] < 120:
-            current_group.append(url_seg)
+    return all_ads
+
+
+def _build_episode_context(title: str | None, description: str | None) -> str:
+    """Build episode context string from title and description."""
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if description:
+        # Strip HTML tags and truncate description
+        import re
+        clean_desc = re.sub(r'<[^>]+>', '', description)
+        clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
+        if len(clean_desc) > 2000:
+            clean_desc = clean_desc[:2000] + "..."
+        parts.append(f"Description: {clean_desc}")
+
+    if not parts:
+        return "No episode metadata available."
+
+    return "\n".join(parts)
+
+
+def _pass1_find_brand_ads(
+    segments: list,
+    episode_context: str,
+    model,
+    tokenizer
+) -> list[tuple[float, float]]:
+    """
+    Pass 1: Find brand ads using deterministic pattern matching + LLM boundary refinement.
+
+    Looks for: URLs, promo codes, sponsor phrases, brand mentions with promotional context.
+    """
+    # Find segments with ad indicators (deterministic)
+    ad_indicator_segments = _find_ad_indicator_segments(segments)
+
+    if not ad_indicator_segments:
+        return []
+
+    # Group nearby indicators (within 2 minutes) as likely same ad block
+    indicator_groups = []
+    current_group = [ad_indicator_segments[0]]
+
+    for indicator in ad_indicator_segments[1:]:
+        if indicator["start"] - current_group[-1]["end"] < 120:
+            current_group.append(indicator)
         else:
-            url_groups.append(current_group)
-            current_group = [url_seg]
-    url_groups.append(current_group)
+            indicator_groups.append(current_group)
+            current_group = [indicator]
+    indicator_groups.append(current_group)
 
-    # For each URL group, find the full ad boundaries and add to our list
-    url_based_ads = []
-    for group_idx, url_group in enumerate(url_groups):
-        group_start = url_group[0]["start"]
-        group_end = url_group[-1]["end"]
+    # For each group, find full ad boundaries using LLM
+    ad_segments = []
+    for group in indicator_groups:
+        group_start = group[0]["start"]
+        group_end = group[-1]["end"]
 
-        # Get context: 90 seconds before first URL, 30 seconds after last URL
+        # Get context: 90 seconds before, 30 seconds after
         context_start = max(0, group_start - 90)
         context_end = min(segments[-1]["end"], group_end + 30)
 
@@ -341,40 +394,34 @@ def detect_ad_segments(transcript: dict) -> list[tuple[float, float]]:
         for seg in segments:
             if seg["start"] >= context_start and seg["end"] <= context_end:
                 speaker = seg.get("speaker", "")
-                if speaker:
-                    context_lines.append(f"[{seg['start']:.1f}s] {speaker}: {seg['text'].strip()}")
-                else:
-                    context_lines.append(f"[{seg['start']:.1f}s]: {seg['text'].strip()}")
+                prefix = f"{speaker}: " if speaker else ""
+                context_lines.append(f"[{seg['start']:.1f}s] {prefix}{seg['text'].strip()}")
 
         context_text = "\n".join(context_lines)
 
-        # URLs in this group
-        urls_found = ", ".join([f"'{u['matched']}' at {u['start']:.0f}s" for u in url_group])
+        # What we found in this group
+        indicators_found = ", ".join([f"'{i['matched']}' at {i['start']:.0f}s" for i in group])
 
         prompt = f"""<|im_start|>system
 You are finding the exact boundaries of an advertisement in a podcast.
 
-EPISODE TOPIC (this is what the real content is about):
-{episode_summary}
+EPISODE INFO:
+{episode_context}
 
-URLs/PROMO CODES FOUND (these are definitely part of ads):
-{urls_found}
+AD INDICATORS FOUND (these are definitely part of an ad):
+{indicators_found}
 
-Your task: Find where this ad STARTS and ENDS.
+Find where this ad STARTS and ENDS.
 
-AD START: Look backwards from the first URL for where they transition INTO the ad:
-- "brought to you by", "sponsored by", "speaking of which"
-- Topic suddenly changes from episode content to product promotion
-- Different speaker starts talking about a product
+AD START - look backwards from the first indicator for:
+- "brought to you by", "sponsored by", "speaking of which", "a]word from our sponsor"
+- Sudden topic change from episode content to product/service promotion
+- Speaker change to someone reading an ad
 
-AD END: Look forwards from the last URL for where they transition OUT of the ad:
-- Host returns to the EPISODE TOPIC (see above)
-- Speaker changes back to main host discussing episode content
-- "anyway", "so", "back to" followed by episode-related content
-
-IMPORTANT:
-- The ad ends when they return to the EPISODE TOPIC, not when they stop mentioning the product
-- Be conservative - don't include episode content in the ad boundaries
+AD END - look forwards from the last indicator for:
+- Return to episode topic (see episode info above)
+- "anyway", "so", "back to", "alright" followed by episode-related content
+- Speaker change back to main host discussing episode content
 
 Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
 <|im_start|>user
@@ -382,13 +429,7 @@ Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
 <|im_start|>assistant
 """
 
-        response = generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=100,
-            verbose=False,
-        )
+        response = generate(model, tokenizer, prompt=prompt, max_tokens=100, verbose=False)
 
         # Parse response
         for end_token in ["<|im_end|>", "<|eot_id|>"]:
@@ -402,85 +443,84 @@ Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
                 boundary = json.loads(json_match.group())
                 start_ms = float(boundary["start"]) * 1000
                 end_ms = float(boundary["end"]) * 1000
-
-                # Sanity check: ad should be at least 10 seconds
-                if end_ms - start_ms >= 10000:
-                    url_based_ads.append((start_ms, end_ms))
+                if end_ms - start_ms >= 10000:  # Min 10 seconds
+                    ad_segments.append((start_ms, end_ms))
         except (json.JSONDecodeError, KeyError, TypeError):
-            # Fallback: use URL group boundaries with some padding
+            # Fallback: use indicator group boundaries with padding
             start_ms = max(0, (group_start - 30)) * 1000
             end_ms = (group_end + 10) * 1000
-            url_based_ads.append((start_ms, end_ms))
+            ad_segments.append((start_ms, end_ms))
 
-    # Combine summary-based and URL-based ads
-    all_ads = ad_segments + url_based_ads
-
-    # Merge overlapping segments
-    if all_ads:
-        all_ads = merge_overlapping_segments(all_ads)
-
-    return all_ads
+    return ad_segments
 
 
-def _find_all_ads_with_summary(
+def _pass2_find_incongruous_content(
     segments: list,
-    episode_summary: str,
+    episode_context: str,
+    existing_ads: list[tuple[float, float]],
     model,
     tokenizer
 ) -> list[tuple[float, float]]:
     """
-    Use the episode summary to find ALL ads, including brand ads without URLs.
+    Pass 2: Find content that is incongruous with both:
+    - The episode description (off-topic)
+    - The surrounding content (contextually out of place)
+
+    This catches brand ads without URLs (e.g., "Sprite", "McDonald's").
     """
-    # Build transcript with timestamps
+    # Build transcript with existing ads marked
+    def is_in_existing_ad(start_s, end_s):
+        start_ms = start_s * 1000
+        end_ms = end_s * 1000
+        for ad_start, ad_end in existing_ads:
+            if start_ms < ad_end and end_ms > ad_start:
+                return True
+        return False
+
     transcript_lines = []
     for seg in segments:
         speaker = seg.get("speaker", "")
-        if speaker:
-            transcript_lines.append(f"[{seg['start']:.1f}s] {speaker}: {seg['text'].strip()}")
-        else:
-            transcript_lines.append(f"[{seg['start']:.1f}s]: {seg['text'].strip()}")
+        prefix = f"{speaker}: " if speaker else ""
+        marker = "[ALREADY MARKED AS AD] " if is_in_existing_ad(seg["start"], seg["end"]) else ""
+        transcript_lines.append(f"{marker}[{seg['start']:.1f}s] {prefix}{seg['text'].strip()}")
 
     transcript_text = "\n".join(transcript_lines)
 
     # Truncate if needed
-    if len(transcript_text) > 150000:
-        transcript_text = transcript_text[:150000] + "\n[truncated]"
+    if len(transcript_text) > 120000:
+        transcript_text = transcript_text[:120000] + "\n[truncated]"
 
     prompt = f"""<|im_start|>system
-You are finding advertisements in a podcast transcript.
+You are finding advertisements that were MISSED in a first pass.
 
-EPISODE CONTENT (what this episode is actually about):
-{episode_summary}
+EPISODE INFO (this is what the episode is actually about):
+{episode_context}
 
-YOUR TASK: Find all advertisements - segments that are NOT about the episode topic above.
+Some segments are already marked as [ALREADY MARKED AS AD] - ignore those.
 
-Ads include:
-- Brand promotions (e.g., "Sprite", "McDonald's") even without URLs
-- Product/service pitches with URLs or promo codes
-- Sponsor messages ("brought to you by", "sponsored by")
-- Pre-roll and mid-roll ad breaks
+Look for UNMARKED segments that are:
+1. OFF-TOPIC: Not related to the episode topic above
+2. PROMOTIONAL: Promoting a product, service, or brand
+3. INCONGRUOUS: Don't fit with what comes before/after
 
-NOT ads:
-- Discussion of the episode's main topic (see summary above)
-- The podcast promoting itself
-- Casual host conversation
+Examples of what to find:
+- Brand mentions with promotional language ("refreshing Sprite", "delicious McDonald's")
+- Product pitches without URLs ("try our new service", "you'll love this app")
+- Sponsor messages that slipped through
 
-For each ad block, return start and end timestamps. Combine consecutive ads into one block.
+Examples of what is NOT an ad:
+- Discussion related to the episode topic (even if mentioning brands as examples)
+- The podcast promoting its own social media or Patreon
+- Casual conversation between hosts
 
-Return JSON array: [{{"start":SECONDS,"end":SECONDS}}]
-Return [] if no ads found.<|im_end|>
+Return JSON array of NEW ad segments only: [{{"start":SECONDS,"end":SECONDS}}]
+Return [] if no additional ads found.<|im_end|>
 <|im_start|>user
 {transcript_text}<|im_end|>
 <|im_start|>assistant
 """
 
-    response = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=1024,
-        verbose=False,
-    )
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=1024, verbose=False)
 
     # Parse response
     for end_token in ["<|im_end|>", "<|eot_id|>"]:
@@ -488,9 +528,8 @@ Return [] if no ads found.<|im_end|>
             response = response.split(end_token)[0]
             break
 
-    ad_segments = []
+    new_ads = []
     try:
-        # Clean up response
         response = re.sub(r'```json\s*', '', response)
         response = re.sub(r'```\s*', '', response)
         response = re.sub(r'(\d+\.?\d*)s([,\}\]])', r'\1\2', response)
@@ -502,14 +541,126 @@ Return [] if no ads found.<|im_end|>
                 start_ms = float(seg["start"]) * 1000
                 end_ms = float(seg["end"]) * 1000
                 if end_ms - start_ms >= 10000:  # Min 10 seconds
-                    ad_segments.append((start_ms, end_ms))
+                    new_ads.append((start_ms, end_ms))
     except (json.JSONDecodeError, KeyError, TypeError):
-        pass  # No valid response
+        pass
+
+    return new_ads
+
+
+def _pass3_verify_boundaries(
+    segments: list,
+    episode_context: str,
+    ad_segments: list[tuple[float, float]],
+    model,
+    tokenizer
+) -> list[tuple[float, float]]:
+    """
+    Pass 3: Verify and refine ad boundaries.
+
+    Reviews the marked transcript and adjusts boundaries where:
+    - Ad started too late (missed the intro)
+    - Ad ended too early (cut off mid-ad)
+    - Ad ended too late (included episode content)
+    """
+    # Build marked transcript
+    def is_in_ad(start_s, end_s):
+        start_ms = start_s * 1000
+        end_ms = end_s * 1000
+        for ad_start, ad_end in ad_segments:
+            if start_ms < ad_end and end_ms > ad_start:
+                return True
+        return False
+
+    marked_lines = []
+    for seg in segments:
+        speaker = seg.get("speaker", "")
+        prefix = f"{speaker}: " if speaker else ""
+        marker = "[REMOVE]" if is_in_ad(seg["start"], seg["end"]) else "[KEEP]"
+        marked_lines.append(f"{marker} [{seg['start']:.1f}s] {prefix}{seg['text'].strip()}")
+
+    marked_transcript = "\n".join(marked_lines)
+
+    # Truncate if needed
+    if len(marked_transcript) > 120000:
+        marked_transcript = marked_transcript[:120000] + "\n[truncated]"
+
+    prompt = f"""<|im_start|>system
+You are verifying ad boundaries in a podcast transcript.
+
+EPISODE INFO:
+{episode_context}
+
+[REMOVE] = will be cut from audio
+[KEEP] = will remain in final audio
+
+Check for these boundary errors:
+
+1. STARTED TOO LATE - Look at [KEEP] lines RIGHT BEFORE [REMOVE] blocks:
+   - Are they ad intros? ("speaking of which", "let me tell you about", "brought to you by")
+   - If yes, include them in the ad
+
+2. ENDED TOO EARLY - Look at [KEEP] lines RIGHT AFTER [REMOVE] blocks:
+   - Are they still ad content? (still promoting the product, final call-to-action)
+   - If yes, extend the ad
+
+3. ENDED TOO LATE - Look at the END of [REMOVE] blocks:
+   - Did we include episode content? (host returns to topic, asks guest a question)
+   - If yes, the ad should have ended earlier
+
+Return corrections as JSON:
+- "adjust": segments where boundaries need fixing - [{{"original_start":SEC,"original_end":SEC,"new_start":SEC,"new_end":SEC}}]
+
+Return {{"adjust":[]}} if boundaries are correct.<|im_end|>
+<|im_start|>user
+{marked_transcript}<|im_end|>
+<|im_start|>assistant
+"""
+
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=1024, verbose=False)
+
+    # Parse response
+    for end_token in ["<|im_end|>", "<|eot_id|>"]:
+        if end_token in response:
+            response = response.split(end_token)[0]
+            break
+
+    response = re.sub(r'```json\s*', '', response)
+    response = re.sub(r'```\s*', '', response)
+    response = re.sub(r'(\d+\.?\d*)s([,\}\]])', r'\1\2', response)
+
+    try:
+        json_match = re.search(r'\{[\s\S]*"adjust"[\s\S]*\}', response)
+        if json_match:
+            corrections = json.loads(json_match.group())
+            adjustments = corrections.get("adjust", [])
+
+            if adjustments:
+                # Apply adjustments
+                adjusted_ads = list(ad_segments)
+                for adj in adjustments:
+                    orig_start_ms = float(adj.get("original_start", 0)) * 1000
+                    orig_end_ms = float(adj.get("original_end", 0)) * 1000
+                    new_start_ms = float(adj.get("new_start", orig_start_ms / 1000)) * 1000
+                    new_end_ms = float(adj.get("new_end", orig_end_ms / 1000)) * 1000
+
+                    # Find and replace the matching segment
+                    for i, (start, end) in enumerate(adjusted_ads):
+                        # Match if close enough (within 5 seconds)
+                        if abs(start - orig_start_ms) < 5000 and abs(end - orig_end_ms) < 5000:
+                            if new_end_ms - new_start_ms >= 10000:  # Min 10 seconds
+                                adjusted_ads[i] = (new_start_ms, new_end_ms)
+                            break
+
+                # Re-merge in case adjustments created overlaps
+                return merge_overlapping_segments(adjusted_ads)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
 
     return ad_segments
 
 
-def _find_url_segments(segments: list) -> list[dict]:
+def _find_ad_indicator_segments(segments: list) -> list[dict]:
     """
     Deterministic scan for segments containing URLs or promo codes.
     Returns list of dicts with segment info and matched pattern.
@@ -573,399 +724,6 @@ def _find_url_segments(segments: list) -> list[dict]:
             })
 
     return url_segments
-
-
-def _summarize_episode_content(segments: list, model, tokenizer) -> str:
-    """
-    Ask LLM to summarize the actual episode content, ignoring ads.
-    This summary becomes the source of truth for what the episode is about.
-    """
-    # Build transcript text
-    transcript_lines = []
-    for seg in segments:
-        start = seg["start"]
-        text = seg["text"].strip()
-        speaker = seg.get("speaker", "")
-        if speaker:
-            transcript_lines.append(f"[{start:.1f}s] {speaker}: {text}")
-        else:
-            transcript_lines.append(f"[{start:.1f}s]: {text}")
-
-    transcript_text = "\n".join(transcript_lines)
-
-    # Truncate if too long (we just need enough to understand the topic)
-    if len(transcript_text) > 100000:
-        transcript_text = transcript_text[:100000] + "\n[truncated]"
-
-    prompt = f"""<|im_start|>system
-You are summarizing a podcast episode. Write a 2-3 sentence summary of what this episode is ACTUALLY ABOUT - the main topic, discussion, story, or interview.
-
-IMPORTANT: Ignore all advertisements, sponsors, and product promotions. Only summarize the real episode content.
-
-Common ad indicators to IGNORE:
-- Product promotions with URLs or promo codes
-- "Brought to you by", "sponsored by" segments
-- Pitches for services like VPNs, meal kits, mattresses, etc.
-
-Focus ONLY on: What is the actual episode discussing? What's the main topic or story?<|im_end|>
-<|im_start|>user
-{transcript_text}<|im_end|>
-<|im_start|>assistant
-This episode is about"""
-
-    response = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=256,
-        verbose=False,
-    )
-
-    # Clean up response
-    for end_token in ["<|im_end|>", "<|eot_id|>"]:
-        if end_token in response:
-            response = response.split(end_token)[0]
-            break
-
-    summary = "This episode is about" + response.strip()
-    return summary
-
-
-def _refine_ad_segments(
-    segments: list,
-    ad_segments_ms: list[tuple[float, float]],
-    model,
-    tokenizer
-) -> list[tuple[float, float]]:
-    """
-    Second pass: Review the marked transcript and refine ad boundaries.
-
-    Shows the LLM which parts are marked as [KEEP] vs [REMOVE] and asks it to:
-    1. Find any missed ads in [KEEP] sections
-    2. Identify any real content incorrectly marked as [REMOVE]
-    """
-    # Deterministic check: find all segments with URLs/promo codes
-    url_segments = _find_url_segments(segments)
-
-    # Find URL segments that are NOT covered by current ad segments
-    def is_covered(url_start, url_end):
-        for ad_start, ad_end in ad_segments_ms:
-            if url_start >= ad_start and url_end <= ad_end:
-                return True
-        return False
-
-    uncovered_urls = [(s, e) for s, e in url_segments if not is_covered(s, e)]
-
-    # Find and auto-fill short gaps between ad blocks (likely missed stacked ads)
-    sorted_ads = sorted(ad_segments_ms, key=lambda x: x[0])
-    auto_filled_gaps = []  # < 60s gaps - auto-fill these
-    suspicious_gaps = []  # 60-180s gaps - ask LLM to check
-
-    for i in range(len(sorted_ads) - 1):
-        _, end_ms = sorted_ads[i]
-        next_start_ms, _ = sorted_ads[i + 1]
-        gap_seconds = (next_start_ms - end_ms) / 1000
-        if 5 < gap_seconds < 60:
-            # Auto-fill short gaps - these are almost certainly missed stacked ads
-            auto_filled_gaps.append((end_ms, next_start_ms))
-        elif 60 <= gap_seconds < 180:
-            suspicious_gaps.append((end_ms / 1000, next_start_ms / 1000))
-
-    # Add auto-filled gaps to ad segments and re-merge
-    if auto_filled_gaps:
-        ad_segments_ms = list(ad_segments_ms) + auto_filled_gaps
-        ad_segments_ms = merge_overlapping_segments(ad_segments_ms)
-
-    # Now build marked transcript with updated ad segments (including auto-filled gaps)
-    def is_in_ad(start_s: float, end_s: float) -> bool:
-        """Check if a segment overlaps with any ad segment."""
-        start_ms = start_s * 1000
-        end_ms = end_s * 1000
-        for ad_start, ad_end in ad_segments_ms:
-            if start_ms < ad_end and end_ms > ad_start:
-                return True
-        return False
-
-    def has_url(start_s: float, end_s: float) -> bool:
-        """Check if segment contains a URL (from our deterministic scan)."""
-        start_ms = start_s * 1000
-        end_ms = end_s * 1000
-        for url_start, url_end in url_segments:
-            if abs(start_ms - url_start) < 100 and abs(end_ms - url_end) < 100:
-                return True
-        return False
-
-    marked_lines = []
-    for seg in segments:
-        start = seg["start"]
-        end = seg["end"]
-        text = seg["text"].strip()
-        speaker = seg.get("speaker", "")
-        in_ad = is_in_ad(start, end)
-        has_url_marker = has_url(start, end) and not in_ad
-        if in_ad:
-            marker = "[REMOVE]"
-        elif has_url_marker:
-            marker = "[KEEP][HAS URL!]"  # Flag URLs not in ad blocks
-        else:
-            marker = "[KEEP]"
-        # Include speaker label if available
-        if speaker:
-            marked_lines.append(f"{marker} [{start:.1f}s - {end:.1f}s] {speaker}: {text}")
-        else:
-            marked_lines.append(f"{marker} [{start:.1f}s - {end:.1f}s]: {text}")
-
-    marked_transcript = "\n".join(marked_lines)
-
-    # Build warnings for prompt
-    extra_warnings = ""
-
-    # Warning about suspicious gaps
-    if suspicious_gaps:
-        gaps_list = ", ".join([f"{s:.0f}s-{e:.0f}s" for s, e in suspicious_gaps])
-        extra_warnings += f"""
-SUSPICIOUS GAPS BETWEEN AD BLOCKS (1-3 minutes):
-{gaps_list}
-Check if these [KEEP] sections contain product promotions - they may be missed ads.
-"""
-
-    # Warning about uncovered URLs - these are VERY likely missed ads
-    if uncovered_urls:
-        extra_warnings += """
-CRITICAL - URLS FOUND IN [KEEP] SECTIONS:
-Lines marked [KEEP][HAS URL!] contain URLs or promo codes but are NOT marked as ads.
-These are almost certainly missed ads! Find the full ad boundaries around these URLs.
-"""
-
-    prompt = f"""<|im_start|>system
-You are reviewing a podcast transcript marked for ad removal. Your job is to find errors.
-
-[REMOVE] = will be cut from audio
-[KEEP] = will remain in final audio
-
-CHECK FOR THESE ERRORS:
-
-1. BOUNDARY ERRORS - Did we start/end ads at the wrong place?
-   - STARTED TOO LATE? Look at [KEEP] lines RIGHT BEFORE [REMOVE] blocks - are they the ad intro? (e.g., "Speaking of...", "You know what helps?", "brought to you by")
-   - ENDED TOO EARLY? Look at [KEEP] lines RIGHT AFTER [REMOVE] blocks - still ad content? (e.g., final URL mention, "check them out")
-   - ENDED TOO LATE? This is critical! Look at the END of each [REMOVE] block for signs the ad already ended:
-     * CONTENT CHANGE: Host returns to episode topic, asks guest a question, references earlier discussion, continues the story
-     * SPEAKER CHANGE: Main host(s) resume speaking after a different speaker did the ad read
-     * TRANSITION PHRASES: "Anyway...", "So...", "Back to...", "As I was saying..."
-     If you see these signs INSIDE a [REMOVE] block, the ad ended too early - return the correct end time in "remove"
-
-2. MISSED ADS - Look through ALL [KEEP] sections for:
-   - Product promotions with URLs (e.g., "visit example.com/podcast")
-   - Promo codes (e.g., "use code SAVE20")
-   - Sponsor mentions with calls-to-action
-   - Host-read ads that blend in naturally
-
-3. FALSE POSITIVES - [REMOVE] sections that are actually episode content (rare, but check)
-
-4. SPEAKER CHANGES - If transcript has speaker labels (SPEAKER_00, etc.):
-   - Different/new speakers often indicate pre-recorded ads
-   - Same speaker but sudden topic change to product promotion = host-read ad
-{extra_warnings}
-Return corrections as JSON:
-- "add": NEW segments to mark as ads (missed ads) - [{{"start":SECONDS,"end":SECONDS}}]
-- "remove": segments currently marked [REMOVE] that should be KEPT (false positives / ad ended too late) - [{{"start":SECONDS,"end":SECONDS}}]
-
-Example: If ad block 100s-200s actually ended at 150s, return {{"add":[],"remove":[{{"start":150,"end":200}}]}} to keep the content from 150-200s.
-
-Return {{"add":[],"remove":[]}} if no corrections needed.
-<|im_end|>
-<|im_start|>user
-{marked_transcript}<|im_end|>
-<|im_start|>assistant
-"""
-
-    response = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=1024,
-        verbose=False,
-    )
-
-    # Parse corrections
-    refined_ads = list(ad_segments_ms)  # Start with initial ads
-
-    # Clean up response
-    for end_token in ["<|im_end|>", "<|eot_id|>"]:
-        if end_token in response:
-            response = response.split(end_token)[0]
-            break
-    response = re.sub(r'```json\s*', '', response)
-    response = re.sub(r'```\s*', '', response)
-    response = re.sub(r'(\d+\.?\d*)s([,\}\]])', r'\1\2', response)
-
-    try:
-        # Look for JSON object with add/remove keys
-        json_match = re.search(r'\{[\s\S]*"add"[\s\S]*"remove"[\s\S]*\}', response)
-        if not json_match:
-            json_match = re.search(r'\{[\s\S]*"remove"[\s\S]*"add"[\s\S]*\}', response)
-
-        if json_match:
-            json_str = json_match.group()
-            corrections = json.loads(json_str)
-
-            # Add missed ads
-            for seg in corrections.get("add", []):
-                start_ms = float(seg["start"]) * 1000
-                end_ms = float(seg["end"]) * 1000
-                if end_ms - start_ms >= 10000:  # Min 10 seconds
-                    refined_ads.append((start_ms, end_ms))
-
-            # Remove false positives
-            for seg in corrections.get("remove", []):
-                start_ms = float(seg["start"]) * 1000
-                end_ms = float(seg["end"]) * 1000
-                # Remove any ad that significantly overlaps with this segment
-                refined_ads = [
-                    (a_start, a_end) for a_start, a_end in refined_ads
-                    if not (a_start < end_ms and a_end > start_ms)
-                ]
-
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass  # Keep original ads if parsing fails
-
-    # Merge overlapping segments
-    if refined_ads:
-        refined_ads = merge_overlapping_segments(refined_ads)
-
-    return refined_ads
-
-
-def _detect_ads_chunked(segments: list, model, tokenizer) -> list[tuple[float, float]]:
-    """Process transcript in chunks for long episodes."""
-    all_ad_segments = []
-
-    # Process in chunks of ~100 segments (roughly 5-10 minutes each)
-    CHUNK_SIZE = 100
-    OVERLAP = 10  # Overlap to catch ads at chunk boundaries
-
-    has_speakers = any("speaker" in seg for seg in segments)
-
-    for i in range(0, len(segments), CHUNK_SIZE - OVERLAP):
-        chunk = segments[i:i + CHUNK_SIZE]
-
-        transcript_lines = []
-        for seg in chunk:
-            start = seg["start"]
-            end = seg["end"]
-            text = seg["text"].strip()
-            speaker = seg.get("speaker", "")
-            if speaker:
-                transcript_lines.append(f"[{start:.1f}s - {end:.1f}s] {speaker}: {text}")
-            else:
-                transcript_lines.append(f"[{start:.1f}s - {end:.1f}s]: {text}")
-
-        transcript_text = "\n".join(transcript_lines)
-
-        chunk_start_time = chunk[0]["start"]
-        chunk_end_time = chunk[-1]["end"]
-
-        speaker_hint = ""
-        if has_speakers:
-            speaker_hint = "\nDifferent speakers (SPEAKER_XX) may indicate pre-recorded ads."
-
-        prompt = f"""<|im_start|>system
-You identify ad breaks in podcasts by detecting when the conversation goes OFF-TOPIC to promote products/services.
-
-HOW TO IDENTIFY ADS:
-1. First, understand the MAIN TOPIC of the episode from the conversation
-2. Ads are OFF-TOPIC segments that promote external products/services (not related to the episode's subject)
-3. Ads typically contain URLs ("visit site.com") or promo codes ("use code SAVE20")
-4. Ads often start with phrases like "this episode is brought to you by" or come after "right after this"
-
-WHAT IS NOT AN AD:
-- Discussion of the episode's main topic, even if products are mentioned as part of the story
-- The podcast promoting itself or its own social media
-- Casual conversation between hosts
-
-RULES:
-1. Return segments where the hosts leave the main topic to promote external products
-2. If multiple ads play back-to-back, combine into ONE segment (start of first to end of last)
-3. Ad ends when hosts return to the episode's main topic
-
-Output: [{{"start":SECONDS,"end":SECONDS}}] or [] if no ads<|im_end|>
-<|im_start|>user
-{transcript_text}<|im_end|>
-<|im_start|>assistant
-"""
-
-        response = generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=1024,
-            verbose=False,
-        )
-
-        chunk_ads = _parse_ad_response(response)
-        all_ad_segments.extend(chunk_ads)
-
-    # Merge overlapping segments from different chunks
-    if all_ad_segments:
-        all_ad_segments = merge_overlapping_segments(all_ad_segments)
-
-        # Do refinement pass on full transcript
-        all_ad_segments = _refine_ad_segments(segments, all_ad_segments, model, tokenizer)
-
-    return all_ad_segments
-
-
-def _parse_ad_response(response: str) -> list[tuple[float, float]]:
-    """Parse LLM response to extract ad segments."""
-    ad_segments = []
-
-    # Stop at the first end-of-turn token if present
-    # Stop at end-of-turn tokens (Qwen uses <|im_end|>, Llama uses <|eot_id|>)
-    for end_token in ["<|im_end|>", "<|eot_id|>"]:
-        if end_token in response:
-            response = response.split(end_token)[0]
-            break
-
-    # Minimum ad duration - ads shorter than 10 seconds are unlikely
-    MIN_AD_DURATION_MS = 10000
-
-    # Clean up common LLM formatting issues before parsing
-    # Remove markdown code blocks
-    response = re.sub(r'```json\s*', '', response)
-    response = re.sub(r'```\s*', '', response)
-    # Remove 's' suffix from numbers in JSON (e.g., "1527.1s" -> "1527.1")
-    response = re.sub(r'(\d+\.?\d*)s([,\}\]])', r'\1\2', response)
-
-    # Try JSON format first: [{"start": 45.0, "end": 120.5}]
-    try:
-        json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', response)
-        if json_match:
-            json_str = json_match.group()
-            segments_data = json.loads(json_str)
-            for seg in segments_data:
-                start_ms = float(seg["start"]) * 1000
-                end_ms = float(seg["end"]) * 1000
-                if end_ms - start_ms >= MIN_AD_DURATION_MS:
-                    ad_segments.append((start_ms, end_ms))
-            return ad_segments
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass  # Try fallback format
-
-    # Fallback: try bracket format like [296.7s - 298.5s]
-    bracket_matches = re.findall(r'\[(\d+\.?\d*)s?\s*-\s*(\d+\.?\d*)s?\]', response)
-    if bracket_matches:
-        for start_str, end_str in bracket_matches:
-            start_ms = float(start_str) * 1000
-            end_ms = float(end_str) * 1000
-            if end_ms - start_ms >= MIN_AD_DURATION_MS:
-                ad_segments.append((start_ms, end_ms))
-        return ad_segments
-
-    # Empty array is valid
-    if re.search(r'\[\s*\]', response):
-        return []
-
-    return ad_segments
 
 
 def merge_overlapping_segments(segments: list[tuple[float, float]], gap_ms: float = 1000) -> list[tuple[float, float]]:
@@ -1063,7 +821,14 @@ def report_status(callback_url: str, episode_id: str, status: str, stage: str | 
 
 
 @app.task(bind=True, name="worker.process_episode")
-def process_episode(self, episode_id: str, audio_url: str, callback_url: str) -> dict:
+def process_episode(
+    self,
+    episode_id: str,
+    audio_url: str,
+    callback_url: str,
+    title: str | None = None,
+    description: str | None = None,
+) -> dict:
     """
     Process a podcast episode to strip ads.
 
@@ -1078,6 +843,8 @@ def process_episode(self, episode_id: str, audio_url: str, callback_url: str) ->
         episode_id: Unique identifier for the episode
         audio_url: URL to download the source audio from
         callback_url: URL to upload the processed audio to
+        title: Episode title (for ad detection context)
+        description: Episode description/show notes (for ad detection context)
     """
     temp_dir = tempfile.mkdtemp(prefix="podcast_purifier_")
     input_path = Path(temp_dir) / f"{episode_id}_input.mp3"
@@ -1126,7 +893,7 @@ def process_episode(self, episode_id: str, audio_url: str, callback_url: str) ->
             state="ANALYZING",
             meta={"episode_id": episode_id, "step": "detecting advertisements"},
         )
-        ad_segments = detect_ad_segments(transcript)
+        ad_segments = detect_ad_segments(transcript, title=title, description=description)
 
         # Save cleaned transcript to desktop
         desktop_path = Path.home() / "Desktop"
