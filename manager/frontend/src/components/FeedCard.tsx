@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { RefreshCw, Podcast, Trash2, Rss, Copy, Check } from 'lucide-react'
+import { RefreshCw, Podcast, Trash2, Rss, Copy, Check, Pencil } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { feedsApi } from '@/lib/api'
 import type { Feed } from '@/types/api'
 
@@ -15,6 +16,8 @@ export function FeedCard({ feed }: FeedCardProps) {
   const queryClient = useQueryClient()
   const [showConfirm, setShowConfirm] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [editingImage, setEditingImage] = useState(false)
+  const [newImageUrl, setNewImageUrl] = useState(feed.image_url || '')
 
   const rssUrl = `${window.location.origin}/feed/${feed.slug}`
 
@@ -51,21 +54,47 @@ export function FeedCard({ feed }: FeedCardProps) {
     },
   })
 
+  const updateImage = useMutation({
+    mutationFn: (imageUrl: string) => feedsApi.updateImage(feed.id, imageUrl),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['feeds'] })
+      setEditingImage(false)
+    },
+  })
+
+  const handleImageSave = () => {
+    if (newImageUrl.trim()) {
+      updateImage.mutate(newImageUrl.trim())
+    }
+  }
+
   return (
     <Card>
       <CardHeader className="pb-3">
         <div className="flex items-start gap-3">
-          {feed.image_url ? (
-            <img
-              src={feed.image_url}
-              alt={feed.title}
-              className="w-12 h-12 rounded-lg object-cover flex-shrink-0"
-            />
-          ) : (
-            <div className="w-12 h-12 rounded-lg bg-muted flex items-center justify-center flex-shrink-0">
-              <Podcast className="h-6 w-6 text-muted-foreground" />
+          <button
+            onClick={() => {
+              setNewImageUrl(feed.image_url || '')
+              setEditingImage(true)
+            }}
+            className="relative group flex-shrink-0"
+            title="Change thumbnail"
+          >
+            {feed.image_url ? (
+              <img
+                src={feed.image_url}
+                alt={feed.title}
+                className="w-12 h-12 rounded-lg object-cover"
+              />
+            ) : (
+              <div className="w-12 h-12 rounded-lg bg-muted flex items-center justify-center">
+                <Podcast className="h-6 w-6 text-muted-foreground" />
+              </div>
+            )}
+            <div className="absolute inset-0 rounded-lg bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+              <Pencil className="h-4 w-4 text-white" />
             </div>
-          )}
+          </button>
           <div className="flex-1 min-w-0">
             <div className="flex items-start justify-between gap-2">
               <CardTitle className="text-lg leading-tight">{feed.title}</CardTitle>
@@ -87,6 +116,38 @@ export function FeedCard({ feed }: FeedCardProps) {
             )}
           </div>
         </div>
+        {editingImage && (
+          <div className="mt-3 space-y-2">
+            <Input
+              type="url"
+              placeholder="Enter image URL..."
+              value={newImageUrl}
+              onChange={(e) => setNewImageUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleImageSave()
+                if (e.key === 'Escape') setEditingImage(false)
+              }}
+              autoFocus
+            />
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                onClick={handleImageSave}
+                disabled={updateImage.isPending || !newImageUrl.trim()}
+              >
+                {updateImage.isPending ? 'Saving...' : 'Save'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setEditingImage(false)}
+                disabled={updateImage.isPending}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex items-center justify-between">

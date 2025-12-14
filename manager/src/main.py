@@ -365,6 +365,30 @@ async def update_feed_auto_process(
     return feed
 
 
+class FeedImageUpdate(BaseModel):
+    image_url: str
+
+
+@api.patch("/feeds/{feed_id}/image", response_model=Feed)
+async def update_feed_image(
+    feed_id: int,
+    update: FeedImageUpdate,
+    session: Session = Depends(get_db_session),
+):
+    """Update the image URL for a feed."""
+    feed = session.get(Feed, feed_id)
+    if not feed:
+        raise HTTPException(status_code=404, detail=f"Feed {feed_id} not found")
+
+    feed.image_url = update.image_url
+    feed.updated_at = datetime.utcnow()
+    session.add(feed)
+    session.commit()
+    session.refresh(feed)
+
+    return feed
+
+
 @api.delete("/feeds/{feed_id}")
 async def delete_feed(
     feed_id: int,

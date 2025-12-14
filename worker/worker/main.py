@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 # Suppress tokenizers parallelism warning (must be before any HF imports)
@@ -45,6 +46,9 @@ WORKER_API_KEY = os.environ.get("WORKER_API_KEY")  # Required for upload authent
 WHISPER_MODEL = "mlx-community/distil-whisper-large-v3"
 LLM_MODEL = "mlx-community/Qwen2.5-14B-Instruct-4bit"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+
+# Directory for storing cleaned audio files that failed to upload
+PENDING_UPLOADS_DIR = Path(os.environ.get("PENDING_UPLOADS_DIR", "/tmp/pending_uploads"))
 
 app = Celery(
     "podcast_purifier_worker",
@@ -443,7 +447,7 @@ Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
                 boundary = json.loads(json_match.group())
                 start_ms = float(boundary["start"]) * 1000
                 end_ms = float(boundary["end"]) * 1000
-                if end_ms - start_ms >= 10000:  # Min 10 seconds
+                if end_ms - start_ms >= 15000:  # Min 15 seconds
                     ad_segments.append((start_ms, end_ms))
         except (json.JSONDecodeError, KeyError, TypeError):
             # Fallback: use indicator group boundaries with padding
@@ -490,6 +494,11 @@ def _pass2_find_incongruous_content(
     if len(transcript_text) > 120000:
         transcript_text = transcript_text[:120000] + "\n[truncated]"
 
+    HIGH_CONFIDENCE = 0.8  # Include these directly
+    MEDIUM_CONFIDENCE = 0.5  # Include if clustered with others
+    CLUSTER_GAP_SECONDS = 20  # Max gap between detections to consider them clustered
+    MIN_AD_DURATION_MS = 15000  # Minimum 15 seconds
+
     prompt = f"""<|im_start|>system
 You are finding advertisements that were MISSED in a first pass.
 
@@ -513,7 +522,12 @@ Examples of what is NOT an ad:
 - The podcast promoting its own social media or Patreon
 - Casual conversation between hosts
 
-Return JSON array of NEW ad segments only: [{{"start":SECONDS,"end":SECONDS}}]
+For each ad found, provide a confidence score (0.0-1.0):
+- 0.9-1.0: Definitely an ad (clear promotional language, brand pitch)
+- 0.7-0.9: Likely an ad (off-topic, sounds promotional)
+- Below 0.7: Uncertain (might be content, might be ad)
+
+Return JSON array: [{{"start":SECONDS,"end":SECONDS,"confidence":0.0-1.0}}]
 Return [] if no additional ads found.<|im_end|>
 <|im_start|>user
 {transcript_text}<|im_end|>
@@ -537,11 +551,45 @@ Return [] if no additional ads found.<|im_end|>
         json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', response)
         if json_match:
             segments_data = json.loads(json_match.group())
+
+            # Collect all valid detections with confidence
+            all_detections = []
             for seg in segments_data:
                 start_ms = float(seg["start"]) * 1000
                 end_ms = float(seg["end"]) * 1000
-                if end_ms - start_ms >= 10000:  # Min 10 seconds
+                confidence = float(seg.get("confidence", 1.0))
+                if end_ms - start_ms >= MIN_AD_DURATION_MS:
+                    all_detections.append((start_ms, end_ms, confidence))
+
+            # Sort by start time
+            all_detections.sort(key=lambda x: x[0])
+
+            # Process detections: high confidence always included,
+            # medium confidence included if clustered
+            for i, (start_ms, end_ms, confidence) in enumerate(all_detections):
+                if confidence >= HIGH_CONFIDENCE:
                     new_ads.append((start_ms, end_ms))
+                elif confidence >= MEDIUM_CONFIDENCE:
+                    # Check if clustered with neighbors
+                    has_neighbor = False
+                    gap_ms = CLUSTER_GAP_SECONDS * 1000
+
+                    # Check previous detection
+                    if i > 0:
+                        prev_end = all_detections[i-1][1]
+                        if start_ms - prev_end <= gap_ms:
+                            has_neighbor = True
+
+                    # Check next detection
+                    if i < len(all_detections) - 1:
+                        next_start = all_detections[i+1][0]
+                        if next_start - end_ms <= gap_ms:
+                            has_neighbor = True
+
+                    if has_neighbor:
+                        new_ads.append((start_ms, end_ms))
+                # Below MEDIUM_CONFIDENCE: discard
+
     except (json.JSONDecodeError, KeyError, TypeError):
         pass
 
@@ -648,7 +696,7 @@ Return {{"adjust":[]}} if boundaries are correct.<|im_end|>
                     for i, (start, end) in enumerate(adjusted_ads):
                         # Match if close enough (within 5 seconds)
                         if abs(start - orig_start_ms) < 5000 and abs(end - orig_end_ms) < 5000:
-                            if new_end_ms - new_start_ms >= 10000:  # Min 10 seconds
+                            if new_end_ms - new_start_ms >= 15000:  # Min 15 seconds
                                 adjusted_ads[i] = (new_start_ms, new_end_ms)
                             break
 
@@ -805,6 +853,44 @@ def remove_ad_segments(
     result.export(output_path, format="mp3")
 
 
+def extract_audio_url_from_tracker(url: str) -> str | None:
+    """
+    Extract the real audio URL from tracking/redirect URLs.
+
+    Many podcast URLs go through tracking services like:
+    - tracking.swap.fm/track/.../traffic.megaphone.fm/file.mp3
+    - pdst.fm/e/...
+
+    Returns the extracted URL or None if not a tracking URL.
+    """
+    # Pattern: tracking URL with embedded real URL in path
+    # e.g., tracking.swap.fm/track/xxx/pscrb.fm/rss/p/traffic.megaphone.fm/FILE.mp3
+    known_audio_hosts = [
+        'traffic.megaphone.fm',
+        'megaphone.fm',
+        'podtrac.com',
+        'dts.podtrac.com',
+        'chtbl.com',
+        'pdst.fm',
+        'anchor.fm',
+        'buzzsprout.com',
+        'libsyn.com',
+        'soundcloud.com',
+        'spreaker.com',
+    ]
+
+    for host in known_audio_hosts:
+        if host in url:
+            # Find the host in the URL path and extract from there
+            idx = url.find(host)
+            if idx > 0:
+                extracted = 'https://' + url[idx:]
+                # Clean up any query params that might be tracking-specific
+                return extracted
+
+    return None
+
+
 def report_status(callback_url: str, episode_id: str, status: str, stage: str | None = None, error_message: str | None = None):
     """Report status change to the Manager."""
     # Derive base URL from callback_url (e.g., http://host/api/upload/1 -> http://host/api)
@@ -818,6 +904,129 @@ def report_status(callback_url: str, episode_id: str, status: str, stage: str | 
         requests.post(status_url, json=payload, timeout=10)
     except Exception:
         pass  # Don't fail the task if status update fails
+
+
+def save_pending_upload(episode_id: str, audio_path: Path, callback_url: str, ad_segments_removed: int) -> Path:
+    """
+    Save a cleaned audio file for later upload retry.
+
+    Returns the path to the saved audio file.
+    """
+    PENDING_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Copy the audio file
+    pending_audio_path = PENDING_UPLOADS_DIR / f"{episode_id}.mp3"
+    shutil.copy2(audio_path, pending_audio_path)
+
+    # Save metadata
+    metadata = {
+        "episode_id": episode_id,
+        "callback_url": callback_url,
+        "ad_segments_removed": ad_segments_removed,
+        "created_at": datetime.utcnow().isoformat(),
+        "retry_count": 0,
+    }
+    metadata_path = PENDING_UPLOADS_DIR / f"{episode_id}.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f)
+
+    logger.info(f"[PENDING] Saved episode {episode_id} for upload retry")
+    return pending_audio_path
+
+
+def attempt_upload(audio_path: Path, episode_id: str, callback_url: str) -> bool:
+    """
+    Attempt to upload a cleaned audio file.
+
+    Returns True if successful, False otherwise.
+    """
+    try:
+        with open(audio_path, "rb") as f:
+            files = {"file": (f"{episode_id}.mp3", f, "audio/mpeg")}
+            headers = {}
+            if WORKER_API_KEY:
+                headers["X-API-Key"] = WORKER_API_KEY
+            response = requests.post(
+                callback_url,
+                files=files,
+                data={"episode_id": episode_id},
+                headers=headers,
+                timeout=600,
+            )
+            response.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"[UPLOAD] Failed to upload episode {episode_id}: {e}")
+        return False
+
+
+def remove_pending_upload(episode_id: str):
+    """Remove a pending upload after successful upload."""
+    audio_path = PENDING_UPLOADS_DIR / f"{episode_id}.mp3"
+    metadata_path = PENDING_UPLOADS_DIR / f"{episode_id}.json"
+
+    if audio_path.exists():
+        audio_path.unlink()
+    if metadata_path.exists():
+        metadata_path.unlink()
+
+    logger.info(f"[PENDING] Removed pending upload for episode {episode_id}")
+
+
+@app.task(name="worker.retry_pending_uploads")
+def retry_pending_uploads(max_retries: int = 5) -> dict:
+    """
+    Retry uploading any pending cleaned audio files.
+
+    This task can be called manually or scheduled via Celery Beat.
+    """
+    if not PENDING_UPLOADS_DIR.exists():
+        return {"checked": 0, "succeeded": 0, "failed": 0, "abandoned": 0}
+
+    results = {"checked": 0, "succeeded": 0, "failed": 0, "abandoned": 0}
+
+    for metadata_path in PENDING_UPLOADS_DIR.glob("*.json"):
+        results["checked"] += 1
+
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"[PENDING] Failed to read metadata {metadata_path}: {e}")
+            continue
+
+        episode_id = metadata["episode_id"]
+        callback_url = metadata["callback_url"]
+        retry_count = metadata.get("retry_count", 0)
+        audio_path = PENDING_UPLOADS_DIR / f"{episode_id}.mp3"
+
+        if not audio_path.exists():
+            logger.warning(f"[PENDING] Audio file missing for episode {episode_id}, removing metadata")
+            metadata_path.unlink()
+            continue
+
+        if retry_count >= max_retries:
+            logger.warning(f"[PENDING] Episode {episode_id} exceeded max retries ({max_retries}), abandoning")
+            report_status(callback_url, episode_id, "failed", None, f"Upload failed after {max_retries} retries")
+            remove_pending_upload(episode_id)
+            results["abandoned"] += 1
+            continue
+
+        logger.info(f"[PENDING] Retrying upload for episode {episode_id} (attempt {retry_count + 1})")
+
+        if attempt_upload(audio_path, episode_id, callback_url):
+            report_status(callback_url, episode_id, "cleaned", None, None)
+            remove_pending_upload(episode_id)
+            results["succeeded"] += 1
+            logger.info(f"[PENDING] Successfully uploaded episode {episode_id} on retry")
+        else:
+            # Update retry count
+            metadata["retry_count"] = retry_count + 1
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f)
+            results["failed"] += 1
+
+    return results
 
 
 @app.task(bind=True, name="worker.process_episode")
@@ -860,8 +1069,22 @@ def process_episode(
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        response = requests.get(audio_url, stream=True, timeout=600, headers=headers)
-        response.raise_for_status()
+
+        # Try original URL, fall back to extracted URL if tracking service fails
+        download_url = audio_url
+        try:
+            response = requests.get(download_url, stream=True, timeout=600, headers=headers)
+            response.raise_for_status()
+        except requests.exceptions.ConnectionError as e:
+            # Tracking service might be down - try extracting the real audio URL
+            fallback_url = extract_audio_url_from_tracker(audio_url)
+            if fallback_url and fallback_url != audio_url:
+                logger.info(f"[DOWNLOAD] Tracking URL failed, trying fallback: {fallback_url}")
+                download_url = fallback_url
+                response = requests.get(download_url, stream=True, timeout=600, headers=headers)
+                response.raise_for_status()
+            else:
+                raise  # Re-raise if no fallback available
 
         with open(input_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
@@ -940,26 +1163,25 @@ def process_episode(
             state="UPLOADING",
             meta={"episode_id": episode_id, "step": "uploading cleaned audio"},
         )
-        with open(output_path, "rb") as f:
-            files = {"file": (f"{episode_id}.mp3", f, "audio/mpeg")}
-            upload_headers = {}
-            if WORKER_API_KEY:
-                upload_headers["X-API-Key"] = WORKER_API_KEY
-            upload_response = requests.post(
-                callback_url,
-                files=files,
-                data={"episode_id": episode_id},
-                headers=upload_headers,
-                timeout=600,
-            )
-            upload_response.raise_for_status()
 
-        return {
-            "status": "success",
-            "episode_id": episode_id,
-            "ad_segments_removed": len(ad_segments),
-            "message": "Episode processed and uploaded successfully",
-        }
+        # Try to upload, save to pending queue on failure
+        if attempt_upload(output_path, episode_id, callback_url):
+            return {
+                "status": "success",
+                "episode_id": episode_id,
+                "ad_segments_removed": len(ad_segments),
+                "message": "Episode processed and uploaded successfully",
+            }
+        else:
+            # Upload failed - save for retry
+            save_pending_upload(episode_id, output_path, callback_url, len(ad_segments))
+            report_status(callback_url, episode_id, "processing", "upload_pending")
+            return {
+                "status": "pending_upload",
+                "episode_id": episode_id,
+                "ad_segments_removed": len(ad_segments),
+                "message": "Episode processed but upload failed - queued for retry",
+            }
 
     except requests.RequestException as e:
         error_msg = f"Network error: {e}"

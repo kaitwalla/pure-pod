@@ -39,6 +39,12 @@ export const feedsApi = {
     fetchAPI<{ message: string; new_episodes: number }>(`/feeds/${feedId}/ingest`, {
       method: 'POST',
     }),
+
+  updateImage: (feedId: number, imageUrl: string) =>
+    fetchAPI<Feed>(`/feeds/${feedId}/image`, {
+      method: 'PATCH',
+      body: JSON.stringify({ image_url: imageUrl }),
+    }),
 }
 
 export interface EpisodeListParams {
