@@ -35,6 +35,9 @@ from celery import Celery
 from mlx_lm import generate, load
 from pyannote.audio import Pipeline as DiarizationPipeline
 from pydub import AudioSegment
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -70,13 +73,32 @@ app.conf.update(
     # Only process one task at a time - MLX models don't support concurrent inference
     worker_concurrency=1,
     worker_prefetch_multiplier=1,
+    # Redis connection resilience for remote connections
+    broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    broker_connection_max_retries=10,
+    broker_pool_limit=1,  # Single connection since we only process one task at a time
+    broker_heartbeat=30,  # Send heartbeat every 30 seconds
+    broker_transport_options={
+        "socket_keepalive": True,
+        "socket_connect_timeout": 30,
+        "socket_timeout": 30,
+    },
+    result_backend_transport_options={
+        "socket_keepalive": True,
+        "socket_connect_timeout": 30,
+        "socket_timeout": 30,
+    },
 )
 
 # Cache loaded models at module level
 _llm_model = None
 _llm_tokenizer = None
 _diarization_pipeline = None
+_embedding_model = None
 _startup_validated = False
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Fast, good quality embeddings
 
 
 def validate_startup():
@@ -197,6 +219,16 @@ def get_llm():
     return _llm_model, _llm_tokenizer
 
 
+def get_embedding_model():
+    """Lazy-load and cache the sentence embedding model."""
+    global _embedding_model
+    if _embedding_model is None:
+        logger.info(f"[EMBEDDINGS] Loading sentence transformer model: {EMBEDDING_MODEL}")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        logger.info("[EMBEDDINGS] Model loaded successfully")
+    return _embedding_model
+
+
 def transcribe_audio(audio_path: str) -> dict:
     """
     Transcribe audio using mlx_whisper with word-level timestamps.
@@ -235,8 +267,8 @@ def diarize_audio(audio_path: str) -> list[tuple[float, float, str]]:
 
     try:
         logger.info("[DIARIZATION] Running speaker diarization...")
-        # Limit max speakers - most podcasts have 2-6 speakers (hosts + guests + ads)
-        diarization = pipeline(wav_path, max_speakers=10)
+        # Limit max speakers - podcasts can have many guests plus ad voices
+        diarization = pipeline(wav_path, max_speakers=15)
 
         segments = []
         for turn, _, speaker in diarization.itertracks(yield_label=True):
@@ -319,8 +351,8 @@ def detect_ad_segments(
     # === PASS 1: Find brand ads (URLs, promo codes, sponsor phrases) ===
     pass1_ads = _pass1_find_brand_ads(segments, episode_context, model, tokenizer)
 
-    # === PASS 2: Find incongruous content ===
-    pass2_ads = _pass2_find_incongruous_content(segments, episode_context, pass1_ads, model, tokenizer)
+    # === PASS 2: Find incongruous content (LLM-based) ===
+    pass2_ads = _pass2_find_incongruous_content_llm(segments, episode_context, pass1_ads, model, tokenizer)
 
     # Combine pass 1 and pass 2 results
     all_ads = pass1_ads + pass2_ads
@@ -328,8 +360,14 @@ def detect_ad_segments(
         all_ads = merge_overlapping_segments(all_ads)
 
     # === PASS 3: Verify and refine boundaries ===
-    if all_ads:
-        all_ads = _pass3_verify_boundaries(segments, episode_context, all_ads, model, tokenizer)
+    # DISABLED - testing if this is causing issues
+    # if all_ads:
+    #     all_ads = _pass3_verify_boundaries(segments, episode_context, all_ads, model, tokenizer)
+
+    # === PASS 4: Deterministic trim at episode content ===
+    # DISABLED - was too aggressive and trimming valid ads
+    # if all_ads:
+    #     all_ads = _pass4_trim_at_episode_content(segments, all_ads)
 
     return all_ads
 
@@ -389,9 +427,11 @@ def _pass1_find_brand_ads(
         group_start = group[0]["start"]
         group_end = group[-1]["end"]
 
-        # Get context: 90 seconds before, 30 seconds after
-        context_start = max(0, group_start - 90)
-        context_end = min(segments[-1]["end"], group_end + 30)
+        # Get context: 120 seconds before, 300 seconds after
+        # Ad blocks can be 3-4+ minutes long (multiple ads back-to-back)
+        # Need more lookback because ad intros ("brought to you by") can be far before the URL
+        context_start = max(0, group_start - 120)
+        context_end = min(segments[-1]["end"], group_end + 300)
 
         # Build context transcript
         context_lines = []
@@ -418,14 +458,25 @@ AD INDICATORS FOUND (these are definitely part of an ad):
 Find where this ad STARTS and ENDS.
 
 AD START - look backwards from the first indicator for:
-- "brought to you by", "sponsored by", "speaking of which", "a]word from our sponsor"
+- "brought to you by", "sponsored by", "speaking of which", "a word from our sponsor"
 - Sudden topic change from episode content to product/service promotion
 - Speaker change to someone reading an ad
+- PRE-ROLL ADS: If the indicator is near the start of the episode, the ad may start at the VERY BEGINNING (0s)
+- Look for the FIRST mention of the product/brand being advertised - that's where the ad starts
 
-AD END - look forwards from the last indicator for:
-- Return to episode topic (see episode info above)
-- "anyway", "so", "back to", "alright" followed by episode-related content
-- Speaker change back to main host discussing episode content
+AD END - look forwards from the last indicator until you find a CLEAR return to episode content:
+- Include ALL ad content: final call-to-action, promo code reminder, "thanks to X", closing pitch
+- The ad ends when the host CLEARLY returns to the episode topic (not just transition words)
+- Do NOT end at "anyway", "so", "alright" - these are often STILL PART of the ad transition
+
+CLEAR signs the episode has resumed (ad has ended):
+- Host says "Welcome back", "We're back", "Alright, back to..."
+- Host addresses the guest by name and asks a question about the episode topic
+- **IMPORTANT**: Discussion returns to topics from the EPISODE TITLE or DESCRIPTION above - this is your best signal!
+- Host references something discussed BEFORE the ad break ("So as we were saying...", "To continue...")
+- The conversation topic matches keywords from the episode description
+- Listener Q&A segments: "question from a listener", "our next/last question", "listener named X", "mailbag", "Q&A"
+- Interview segments resuming: "so tell me about", "what do you think about", "how did you"
 
 Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
 <|im_start|>user
@@ -458,7 +509,7 @@ Return ONLY: {{"start":SECONDS,"end":SECONDS}}<|im_end|>
     return ad_segments
 
 
-def _pass2_find_incongruous_content(
+def _pass2_find_incongruous_content_llm(
     segments: list,
     episode_context: str,
     existing_ads: list[tuple[float, float]],
@@ -466,7 +517,8 @@ def _pass2_find_incongruous_content(
     tokenizer
 ) -> list[tuple[float, float]]:
     """
-    Pass 2: Find content that is incongruous with both:
+    Pass 2 (LLM version - DEPRECATED, kept for reference):
+    Find content that is incongruous with both:
     - The episode description (off-topic)
     - The surrounding content (contextually out of place)
 
@@ -507,25 +559,49 @@ EPISODE INFO (this is what the episode is actually about):
 
 Some segments are already marked as [ALREADY MARKED AS AD] - ignore those.
 
-Look for UNMARKED segments that are:
-1. OFF-TOPIC: Not related to the episode topic above
-2. PROMOTIONAL: Promoting a product, service, or brand
-3. INCONGRUOUS: Don't fit with what comes before/after
+Find UNMARKED segments that are INCONGRUOUS with the episode content - they don't belong.
+
+KEY SIGNAL: Does this segment fit the episode topic above? If NOT, it's probably an ad.
+
+PRE-ROLL ADS (at the very beginning):
+- Check the FIRST 3-5 MINUTES carefully - pre-roll ads often appear before the episode intro
+- Pre-roll ads may start abruptly without "brought to you by" - just straight into the pitch
+- Look for: product pitches, brand mentions, promotional content BEFORE the hosts introduce the episode
+- The episode usually starts with: theme music, host introduction, episode topic overview
+
+BRAND ADS (no URLs/promo codes - just brand mentions):
+- Sudden pivot to talking about a product/service/brand unrelated to episode topic
+- Descriptive language about a product ("crispy", "refreshing", "delicious", "smooth", "premium")
+- Benefits/features of a product that has nothing to do with the episode
+- "I love [brand]", "I've been using [product]", "[Brand] has been great"
+- Any product/service pitch that interrupts the natural flow of conversation
+
+IMPORTANT: Ads often REPEAT multiple times per episode. Each instance is still an ad!
+- The same product pitch appearing 2-3 times = 2-3 separate ads to mark
+- Mark EACH instance separately
+
+How to identify brand ads:
+1. **READ THE EPISODE TITLE AND DESCRIPTION CAREFULLY** - what is this episode actually about?
+2. Content that matches the title/description = EPISODE CONTENT, not an ad
+3. Find segments where the topic SHIFTS AWAY from the title/description to something unrelated (a product, brand, service)
+4. These shifts are ads, even without URLs or "use code X"
+5. When in doubt, check: does this segment relate to the episode title/description? If yes, it's NOT an ad.
 
 Examples of what to find:
-- Brand mentions with promotional language ("refreshing Sprite", "delicious McDonald's")
-- Product pitches without URLs ("try our new service", "you'll love this app")
-- Sponsor messages that slipped through
+- "Speaking of comfort, I've been sleeping so much better on my new [mattress brand]..."
+- "You know what I love? [Food brand]. So crispy and delicious..."
+- "I've been using [app/service] and it's changed how I [do thing]..."
+- Any segment praising a product/brand that has nothing to do with the episode topic
 
 Examples of what is NOT an ad:
-- Discussion related to the episode topic (even if mentioning brands as examples)
+- Discussion related to the episode topic (even if mentioning brands as examples relevant to the topic)
 - The podcast promoting its own social media or Patreon
-- Casual conversation between hosts
+- Hosts casually mentioning something they bought in context of the conversation topic
 
 For each ad found, provide a confidence score (0.0-1.0):
-- 0.9-1.0: Definitely an ad (clear promotional language, brand pitch)
-- 0.7-0.9: Likely an ad (off-topic, sounds promotional)
-- Below 0.7: Uncertain (might be content, might be ad)
+- 0.9-1.0: Definitely an ad (clear brand pitch unrelated to episode)
+- 0.7-0.9: Likely an ad (product praise that seems out of place)
+- 0.5-0.7: Possible ad (unclear if organic mention or sponsored)
 
 Return JSON array: [{{"start":SECONDS,"end":SECONDS,"confidence":0.0-1.0}}]
 Return [] if no additional ads found.<|im_end|>
@@ -596,6 +672,127 @@ Return [] if no additional ads found.<|im_end|>
     return new_ads
 
 
+def _pass2_find_incongruous_content(
+    segments: list,
+    episode_context: str,
+    existing_ads: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """
+    Pass 2 (Embedding version): Find content that is semantically different from the episode topic.
+
+    Uses sentence embeddings to:
+    1. Create a "topic anchor" from the episode title/description
+    2. Score each segment by similarity to the topic
+    3. Find contiguous low-similarity regions as candidate ads
+
+    This catches ads that don't have explicit markers but are off-topic.
+    """
+    embedding_model = get_embedding_model()
+
+    if not segments:
+        return []
+
+    # Skip segments already marked as ads
+    def is_in_existing_ad(start_s, end_s):
+        start_ms = start_s * 1000
+        end_ms = end_s * 1000
+        for ad_start, ad_end in existing_ads:
+            if start_ms < ad_end and end_ms > ad_start:
+                return True
+        return False
+
+    # Create topic anchor embedding from episode context
+    if not episode_context or episode_context == "No episode metadata available.":
+        logger.warning("[EMBEDDINGS] No episode context available, skipping Pass 2")
+        return []
+
+    topic_embedding = embedding_model.encode([episode_context])[0]
+
+    # Group segments into chunks for more stable embeddings
+    # Individual segments can be too short for meaningful comparison
+    CHUNK_SIZE = 5  # Number of segments per chunk
+    MIN_SIMILARITY_THRESHOLD = 0.15  # Below this = likely off-topic
+    LOW_SIMILARITY_THRESHOLD = 0.25  # Below this = possibly off-topic
+    MIN_AD_DURATION_MS = 15000  # Minimum 15 seconds
+
+    # Build chunks
+    chunks = []
+    for i in range(0, len(segments), CHUNK_SIZE):
+        chunk_segments = segments[i:i + CHUNK_SIZE]
+
+        # Skip if most of chunk is already marked as ad
+        ad_count = sum(1 for seg in chunk_segments if is_in_existing_ad(seg["start"], seg["end"]))
+        if ad_count > len(chunk_segments) / 2:
+            continue
+
+        chunk_text = " ".join(seg["text"].strip() for seg in chunk_segments)
+        chunk_start = chunk_segments[0]["start"]
+        chunk_end = chunk_segments[-1]["end"]
+
+        chunks.append({
+            "text": chunk_text,
+            "start": chunk_start,
+            "end": chunk_end,
+            "segments": chunk_segments,
+        })
+
+    if not chunks:
+        return []
+
+    # Generate embeddings for all chunks
+    chunk_texts = [c["text"] for c in chunks]
+    chunk_embeddings = embedding_model.encode(chunk_texts)
+
+    # Calculate similarity to topic anchor
+    for i, chunk in enumerate(chunks):
+        similarity = cosine_similarity([chunk_embeddings[i]], [topic_embedding])[0][0]
+        chunk["similarity"] = similarity
+
+    # Log similarity scores for debugging
+    logger.info("[EMBEDDINGS] Chunk similarities to episode topic:")
+    for chunk in chunks[:10]:  # Log first 10 for brevity
+        logger.info(f"  [{chunk['start']:.1f}s - {chunk['end']:.1f}s] sim={chunk['similarity']:.3f}: {chunk['text'][:80]}...")
+
+    # Find low-similarity regions
+    low_sim_chunks = []
+    for chunk in chunks:
+        if chunk["similarity"] < LOW_SIMILARITY_THRESHOLD:
+            low_sim_chunks.append(chunk)
+
+    if not low_sim_chunks:
+        logger.info("[EMBEDDINGS] No low-similarity chunks found")
+        return []
+
+    # Group consecutive low-similarity chunks
+    ad_regions = []
+    current_region = [low_sim_chunks[0]]
+
+    for chunk in low_sim_chunks[1:]:
+        # Check if this chunk is close to the previous one (within 30 seconds)
+        if chunk["start"] - current_region[-1]["end"] < 30:
+            current_region.append(chunk)
+        else:
+            ad_regions.append(current_region)
+            current_region = [chunk]
+    ad_regions.append(current_region)
+
+    # Convert regions to ad segments
+    new_ads = []
+    for region in ad_regions:
+        start_ms = region[0]["start"] * 1000
+        end_ms = region[-1]["end"] * 1000
+
+        # Calculate average similarity for the region
+        avg_similarity = sum(c["similarity"] for c in region) / len(region)
+
+        # Only include if below threshold and long enough
+        if avg_similarity < LOW_SIMILARITY_THRESHOLD and end_ms - start_ms >= MIN_AD_DURATION_MS:
+            logger.info(f"[EMBEDDINGS] Found off-topic region: {start_ms/1000:.1f}s - {end_ms/1000:.1f}s (avg_sim={avg_similarity:.3f})")
+            new_ads.append((start_ms, end_ms))
+
+    return new_ads
+
+
 def _pass3_verify_boundaries(
     segments: list,
     episode_context: str,
@@ -650,11 +847,18 @@ Check for these boundary errors:
 
 2. ENDED TOO EARLY - Look at [KEEP] lines RIGHT AFTER [REMOVE] blocks:
    - Are they still ad content? (still promoting the product, final call-to-action)
-   - If yes, extend the ad
+   - Are they transition phrases that are part of the ad? ("check them out", "thanks again to", "alright")
+   - Is the ACTUAL return to episode content further down? Look for: guest questions, topic discussion, "welcome back"
+   - If yes, extend the ad to include everything up to the real episode content
 
-3. ENDED TOO LATE - Look at the END of [REMOVE] blocks:
-   - Did we include episode content? (host returns to topic, asks guest a question)
-   - If yes, the ad should have ended earlier
+3. ENDED TOO LATE - Adjust if we included clear episode content:
+   - **KEY**: Does the content match the EPISODE TITLE or DESCRIPTION above? If yes, it's episode content!
+   - Listener Q&A: "question from a listener", "our next/last question", "listener named X"
+   - Interview resuming: host asks guest a question about the episode topic
+   - A single transition word ("anyway", "so", "alright") is NOT enough to trim
+   - But content matching the episode description IS enough to trim
+
+BIAS: When in doubt, keep the full ad segment. It's better to remove a bit of transition than leave ad content.
 
 Return corrections as JSON:
 - "adjust": segments where boundaries need fixing - [{{"original_start":SEC,"original_end":SEC,"new_start":SEC,"new_end":SEC}}]
@@ -708,6 +912,184 @@ Return {{"adjust":[]}} if boundaries are correct.<|im_end|>
     return ad_segments
 
 
+def _pass4_trim_at_episode_content(
+    segments: list,
+    ad_segments: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """
+    Pass 4: Deterministically trim ads that include clear episode content.
+
+    Checks both directions:
+    - START: If ad begins with episode content, move start forward
+    - END: If ad ends with episode content, move end backward
+    """
+    # Patterns that indicate EPISODE CONTENT (not ads)
+    # NOTE: Only include patterns that are UNAMBIGUOUS - would never appear in an ad
+    episode_content_patterns = [
+        # Listener Q&A segments - very specific, won't appear in ads
+        r'\b(first|next|last|final)\s+question\b',
+        r'\bquestion\s+(from|comes?\s+from)\b',
+        r'\blistener\s+named\b',
+        r'\blistener\s+in\s+\w+\b',  # "listener in Indianapolis"
+        r'\bwrites\s+in\b',  # "John writes in"
+        r'\bmailbag\b',
+        r'\bq\s*&\s*a\b',
+        r'\b(she|he)\s+asked\b',  # "she asked about"
+        r'\b(she|he)\'s\s+wondered\b',  # "she's wondered about"
+        r'\bwondered\s+about\b',
+        # Listener speaking (first person statements about hobbies, experiences)
+        r'\bi\s+am\s+a\s+big\b',  # "I am a big musical lover"
+        r'\bi\s+go\s+to\s+(live|the)\b',  # "I go to live shows"
+        r'\bi\'ve\s+(always|been|never)\b',  # "I've always wondered"
+        # Interview/discussion continuation
+        r'\b(she|he|they)\'s\s+(sort\s+of\s+)?(singing|playing|doing|saying|showing|wondered)\b',
+        r'\bthat\s+is\s+a\s+really\s+(incredible|amazing|great)\b',
+        r'\bworth\s+the\s+price\b',
+        r'\bprice\s+of\s+admission\b',
+        # Story/narrative continuation
+        r'\bso\s+(she|he|they)\s+(said|did|went|started)\b',
+        r'\band\s+then\s+(she|he|they)\b',
+        r'\band\s+(she|he|they)\'s\b',  # "And she's wondered"
+        r'\bwhile\s+(she|he|they)\b',
+        # Emotional reactions (audience, etc.)
+        r'\bi\s+love\s+you\b',
+        # Return from break indicators
+        r'\bwelcome\s+back\b',
+        r'\bwe\'?re\s+back\b',
+        r'\bback\s+to\s+(the|our)\b',
+        r'\bas\s+(we|i)\s+was\s+saying\b',
+        r'\bto\s+continue\b',
+    ]
+
+    # Patterns that indicate AD/PROMO content (should be removed)
+    ad_content_patterns = [
+        # Ad intro phrases (start of ads)
+        r'\bbrought\s+to\s+you\s+by\b',
+        r'\bsponsored\s+by\b',
+        r'\btoday\'?s\s+sponsor\b',
+        r'\bsupport\s+(for\s+)?(this|the)\s+(show|podcast|episode)\b',
+        r'\bword\s+from\s+(our\s+)?sponsor\b',
+        r'\blet\s+me\s+tell\s+you\s+about\b',
+        r'\bintroducing\b',
+        r'\bhave\s+you\s+(ever\s+)?(tried|heard|wondered)\b',
+        r'\bever\s+wish(ed)?\b',
+        r'\btired\s+of\b',
+        r'\bstruggling\s+with\b',
+        # URLs and calls to action
+        r'\b\w+\.(com|org|co|net)\b',  # URLs
+        r'\bgo\s+to\s+\w+\b',  # "go to site"
+        r'\bvisit\s+\w+\b',  # "visit site"
+        r'\bcheck\s+out\s+\w+\b',  # "check out site"
+        r'\bhead\s+(to|over)\b',  # "head to"
+        r'\bsign\s+up\b',  # "sign up"
+        r'\bclick\s+(the\s+)?link\b',  # "click the link"
+        # Promo codes and specific offers
+        r'\bpromo\s*code\b',
+        r'\buse\s+code\b',
+        r'\bdiscount\s+code\b',
+        r'\b\d+%\s*off\b',  # "50% off"
+        r'\bfree\s+(trial|for\s+\d+)\b',  # "free trial" or "free for 30 days"
+        r'\bfree\s+shipping\b',
+        r'\bno\s+credit\s+card\b',  # "no credit card required"
+        r'\bcancel\s+anytime\b',
+        r'\bmoney[\s-]back\b',
+        # Thanks/closing sponsor mentions
+        r'\bthanks\s+to\s+\w+\s+for\s+sponsor',
+        # Donation/membership asks
+        r'\bplease\s+(consider\s+)?(support|donat)',
+        r'\bgive\s+today\b',
+        r'\bdonate\s+(now|today)\b',
+        r'\bbecome\s+a\s+\w+\s*(plus\s+)?member\b',
+        r'\b(slate|patreon|substack)\s*plus\s*(member|$)',
+        r'\bjoin\s+(us\s+)?(on\s+)?(patreon|substack)\b',
+    ]
+
+    combined_episode_pattern = '|'.join(episode_content_patterns)
+    combined_ad_pattern = '|'.join(ad_content_patterns)
+
+    trimmed_ads = []
+
+    for ad_start_ms, ad_end_ms in ad_segments:
+        # Get segments within this ad
+        ad_segs = [
+            seg for seg in segments
+            if seg["start"] * 1000 >= ad_start_ms - 1000  # Small tolerance
+            and seg["end"] * 1000 <= ad_end_ms + 1000
+        ]
+
+        if not ad_segs:
+            trimmed_ads.append((ad_start_ms, ad_end_ms))
+            continue
+
+        # Classify each segment
+        classified = []
+        for seg in ad_segs:
+            text = seg["text"]
+            is_episode = bool(re.search(combined_episode_pattern, text, re.IGNORECASE))
+            is_ad = bool(re.search(combined_ad_pattern, text, re.IGNORECASE))
+            classified.append({
+                "seg": seg,
+                "is_episode": is_episode,
+                "is_ad": is_ad,
+            })
+
+        # Find first segment that's clearly an ad (for trimming start)
+        first_ad_idx = None
+        for i, c in enumerate(classified):
+            if c["is_ad"] and not c["is_episode"]:
+                first_ad_idx = i
+                break
+
+        # Find last segment that's clearly an ad (for trimming end)
+        last_ad_idx = None
+        for i in range(len(classified) - 1, -1, -1):
+            if classified[i]["is_ad"] and not classified[i]["is_episode"]:
+                last_ad_idx = i
+                break
+
+        new_start_ms = ad_start_ms
+        new_end_ms = ad_end_ms
+
+        # Strategy: Find the first and last segments that are clearly ads,
+        # then find any episode content before/after and trim to exclude it
+
+        if last_ad_idx is not None:
+            # Find FIRST episode content segment AFTER the last ad segment
+            for c in classified[last_ad_idx + 1:]:
+                if c["is_episode"] and not c["is_ad"]:
+                    # Trim end to just after the last ad segment
+                    new_end_ms = classified[last_ad_idx]["seg"]["end"] * 1000
+                    break
+
+        if first_ad_idx is not None:
+            # Find LAST episode content segment BEFORE the first ad segment
+            for c in reversed(classified[:first_ad_idx]):
+                if c["is_episode"] and not c["is_ad"]:
+                    # Trim start to the first ad segment
+                    new_start_ms = classified[first_ad_idx]["seg"]["start"] * 1000
+                    break
+
+        # Also trim consecutive episode content from the very edges
+        # This handles cases where there's no clear ad marker but episode content at edges
+        for c in classified:
+            if c["is_episode"] and not c["is_ad"]:
+                new_start_ms = max(new_start_ms, c["seg"]["end"] * 1000)
+            else:
+                break
+
+        for c in reversed(classified):
+            if c["is_episode"] and not c["is_ad"]:
+                new_end_ms = min(new_end_ms, c["seg"]["start"] * 1000)
+            else:
+                break
+
+        # Only keep if still a valid ad (at least 10 seconds)
+        if new_end_ms - new_start_ms >= 10000:
+            trimmed_ads.append((new_start_ms, new_end_ms))
+
+    return trimmed_ads
+
+
 def _find_ad_indicator_segments(segments: list) -> list[dict]:
     """
     Deterministic scan for segments containing URLs or promo codes.
@@ -719,6 +1101,8 @@ def _find_ad_indicator_segments(segments: list) -> list[dict]:
         r'\b\w+\.com\b',  # something.com
         r'\b\w+\.org\b',  # something.org
         r'\b\w+\.co\b',   # something.co
+        r'\b\w+\.gov\b',  # something.gov
+        r'\b\w+\.net\b',  # something.net
         r'\b\w+\s+dot\s+com\b',  # "something dot com"
         r'\bslash\s+\w+',  # "slash podcastname" (spoken URL)
         r'\bforward\s+slash',  # "forward slash"
@@ -730,6 +1114,10 @@ def _find_ad_indicator_segments(segments: list) -> list[dict]:
         r'\bcheck\s+out\s+\w+',  # "check out sitename"
         r'\bsign\s+up\s+(at|for)',  # "sign up at/for"
         r'\bdownload\s+(the\s+)?app',  # "download the app"
+        r'\bapply\s+now\b',  # "apply now"
+        r'\bbook\s+now\b',  # "book now"
+        r'\bsave\s+(over\s+)?\$?\d+',  # "save $200" or "save over $200"
+        r'\bbonuses?\s+up\s+to\b',  # "bonuses up to $50,000"
         # Promo codes
         r'\bpromo\s*code\b',  # promo code
         r'\bcode\s+[A-Z0-9]+\b',  # code SAVE20
@@ -742,15 +1130,77 @@ def _find_ad_indicator_segments(segments: list) -> list[dict]:
         r'\bfirst\s+\w+\s+free\b',  # first month free
         r'\bfree\s+shipping\b',  # free shipping
         r'\bmoney[\s-]back\s+guarantee\b',  # money-back guarantee
+        r'\blimited\s+time\b',  # "limited time"
+        r'\bspecial\s+offer\b',  # "special offer"
+        r'\bexclusive\s+(offer|deal|discount)',  # "exclusive offer"
+        r'\brisk[\s-]free\b',  # "risk-free"
+        r'\bwhile\s+supplies\s+last\b',  # "while supplies last"
+        # Retail/availability language
+        r'\bavailab(le|ility)\b',  # "available" or "availability"
+        r'\bin\s+stores\s+(now|today|nationwide)',  # "in stores now"
+        r'\bfind\s+(it|us|them)\s+(at|in)\b',  # "find it at"
+        r'\bnow\s+available\b',  # "now available"
+        r'\bget\s+(it|yours)\s+(now|today|at)\b',  # "get yours today"
+        r'\bfor\s+a\s+limited\s+time\b',  # "for a limited time"
+        # Ad break transition phrases (indicates ad is starting/ending)
+        r'\bafter\s+(the\s+)?break\b',  # "after the break" / "after break"
+        r'\bbefore\s+(the\s+)?break\b',  # "before the break"
+        r'\bwhen\s+we\s+(come|get)\s+back\b',  # "when we come back" / "when we get back"
+        r'\bwe\'?ll\s+be\s+right\s+back\b',  # "we'll be right back"
+        r'\bright\s+after\s+this\b',  # "right after this"
+        r'\bstay\s+(tuned|with\s+us)\b',  # "stay tuned" / "stay with us"
+        r'\bafter\s+these\s+messages\b',  # "after these messages"
+        r'\btake\s+a\s+(quick\s+)?break\b',  # "take a break" / "take a quick break"
+        r'\bquick\s+break\b',  # "quick break"
+        r'\bshort\s+break\b',  # "short break"
+        r'\blet\'?s\s+take\s+a\s+break\b',  # "let's take a break"
         # Sponsor phrases (strong ad indicators)
         r'\bbrought\s+to\s+you\s+by\b',  # "brought to you by"
         r'\bsponsored\s+by\b',  # "sponsored by"
         r'\bsupport(ed)?\s+(for\s+)?(this\s+)?(show|podcast|episode)\s+(comes?\s+from|is\s+brought)',  # "support for this show comes from"
         r'\btoday\'?s\s+sponsor\b',  # "today's sponsor"
-        r'\bour\s+sponsor\b',  # "our sponsor"
+        r'\bour\s+sponsor(s)?\b',  # "our sponsor(s)"
         r'\bthis\s+(episode|show|podcast)\s+is\s+(brought|sponsored)',  # "this episode is brought/sponsored"
         r'\blet\s+me\s+tell\s+you\s+about\b',  # "let me tell you about" (host-read intro)
         r'\bword\s+from\s+(our\s+)?sponsor',  # "word from our sponsor"
+        r'\bthanks\s+to\s+\w+\s+for\s+sponsor',  # "thanks to X for sponsoring"
+        r'\bmade\s+possible\s+by\b',  # "made possible by"
+        r'\bquick\s+(word|message|break)\s+from',  # "quick word from"
+        r'\bpresented\s+by\b',  # "presented by"
+        r'\bpowered\s+by\b',  # "powered by"
+        r'\bin\s+partnership\s+with\b',  # "in partnership with"
+        r'\bpartnered\s+with\b',  # "partnered with"
+        r'\bshoutout\s+to\b',  # "shoutout to" (sponsor mention)
+        r'\bbig\s+thanks\s+to\b',  # "big thanks to"
+        r'\bspecial\s+thanks\s+to\b',  # "special thanks to"
+        r'\bwant\s+to\s+thank\b',  # "want to thank"
+        r'\bgotta\s+thank\b',  # "gotta thank"
+        r'\bhuge\s+thanks\s+to\b',  # "huge thanks to"
+        # Legal disclaimers (VERY reliable - almost never in regular content)
+        r'\btaxes\s+(and|&)\s+fees\b',  # "taxes and fees"
+        r'\brestrictions?\s+appl(y|ies)\b',  # "restrictions apply"
+        r'\bterms\s+(and|&)\s+conditions\b',  # "terms and conditions"
+        r'\bsee\s+(website|site|store)\s+for\s+details\b',  # "see website for details"
+        r'\boffer\s+(valid|expires|ends)\b',  # "offer valid/expires"
+        r'\bsubject\s+to\s+(change|availability)\b',  # "subject to change"
+        r'\bsome\s+(restrictions|exclusions)\b',  # "some restrictions"
+        r'\bnot\s+available\s+in\s+all\b',  # "not available in all areas"
+        r'\bguaranteed\b',  # "guaranteed" (common in ads)
+        r'\brequires?\s+(at\s+least|minimum)\b',  # "requires at least"
+        r'\bspeeds?\s+(may\s+)?(vary|reduce|decrease)\b',  # "speeds may vary"
+        r'\bdata\s+(speeds?|limits?|caps?)\b',  # "data speeds/limits"
+        r'\b(unlimited|megabits?|gigabits?|gigs?)\b',  # telecom terms
+        r'\bprice\s+(lock|guarantee|protection)\b',  # "price lock"
+        r'\bwon\'?t\s+go\s+up\b',  # "won't go up"
+        r'\bfor\s+up\s+to\s+(\d+|one|two|three|four|five)\s+(years?|months?)\b',  # "for up to 3 years"
+        r'\bup\s+to\s+(\d+|one|two|three|four|five)\s+(years?|months?)\s+guarantee',  # "up to 3 years guaranteed"
+        # Pharma/regulated (hard anchors)
+        r'\bask\s+your\s+(doctor|physician)',  # "ask your doctor"
+        r'\bside\s+effects\s+(may\s+)?include',  # "side effects include"
+        r'\b1-8(00|77|88|66)',  # 1-800 numbers
+        # Alcohol ads
+        r'\bdrink\s+responsibly\b',  # "drink responsibly"
+        r'\bmust\s+be\s+21\b',  # "must be 21"
     ]
 
     # Combine patterns
@@ -866,9 +1316,10 @@ def extract_audio_url_from_tracker(url: str) -> str | None:
     # Pattern: tracking URL with embedded real URL in path
     # e.g., tracking.swap.fm/track/xxx/pscrb.fm/rss/p/traffic.megaphone.fm/FILE.mp3
     known_audio_hosts = [
+        'stitcher.simplecastaudio.com',
+        'simplecastaudio.com',
         'traffic.megaphone.fm',
         'megaphone.fm',
-        'podtrac.com',
         'dts.podtrac.com',
         'chtbl.com',
         'pdst.fm',
@@ -877,6 +1328,14 @@ def extract_audio_url_from_tracker(url: str) -> str | None:
         'libsyn.com',
         'soundcloud.com',
         'spreaker.com',
+        'rss.art19.com',
+        'arttrk.com',
+        'omny.fm',
+        'omnycontent.com',
+        'podbean.com',
+        'audioboom.com',
+        'captivate.fm',
+        'transistor.fm',
     ]
 
     for host in known_audio_hosts:
@@ -1117,33 +1576,6 @@ def process_episode(
             meta={"episode_id": episode_id, "step": "detecting advertisements"},
         )
         ad_segments = detect_ad_segments(transcript, title=title, description=description)
-
-        # Save cleaned transcript to desktop
-        desktop_path = Path.home() / "Desktop"
-        cleaned_transcript_path = desktop_path / f"episode_{episode_id}_cleaned.txt"
-
-        def is_in_ad(start_s, end_s, ad_segs):
-            """Check if a segment overlaps with any ad segment."""
-            start_ms = start_s * 1000
-            end_ms = end_s * 1000
-            for ad_start, ad_end in ad_segs:
-                if start_ms < ad_end and end_ms > ad_start:
-                    return True
-            return False
-
-        with open(cleaned_transcript_path, "w") as f:
-            f.write(f"=== CLEANED TRANSCRIPT (Episode {episode_id}) ===\n")
-            f.write(f"=== Ad segments removed: {len(ad_segments)} ===\n\n")
-            for i, (start_ms, end_ms) in enumerate(ad_segments):
-                f.write(f"  [AD {i+1}] {start_ms/1000:.1f}s - {end_ms/1000:.1f}s (duration: {(end_ms-start_ms)/1000:.1f}s)\n")
-            f.write("\n--- Transcript ---\n\n")
-            for seg in transcript.get("segments", []):
-                speaker = seg.get("speaker", "")
-                prefix = f"{speaker}: " if speaker else ""
-                if is_in_ad(seg["start"], seg["end"], ad_segments):
-                    f.write(f"[REMOVED] [{seg['start']:.1f}s - {seg['end']:.1f}s] {prefix}{seg['text'].strip()}\n")
-                else:
-                    f.write(f"[KEPT]    [{seg['start']:.1f}s - {seg['end']:.1f}s] {prefix}{seg['text'].strip()}\n")
 
         # Step 4: Remove ads
         report_status(callback_url, episode_id, "processing", "cutting")
